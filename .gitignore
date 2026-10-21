@@ -1,3 +1,9 @@
 TASK.md
 lane.log
 .venv/
+.claude/
+.doctor_runs/
+.pytest_cache/
+__pycache__/
+*.pyc
+brag-output*/

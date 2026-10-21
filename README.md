@@ -1,55 +1,162 @@
-# Raindrop: feature proposal
+# Delivery Doctor
 
-- **Company:** Raindrop (raindrop.ai), monitoring for AI agents in production. Raindrop 2.0 adds "Self-Healing Agents", where a coding agent fixes the issue and the fix becomes an eval.
-- **Role:** Forward Deployed Engineer (FDE), San Francisco, in person. Focus: get customers running on Raindrop, own their problems end to end across their agents and Raindrop's platform, and turn field learnings into product feedback.
-- **Posting:** https://jobs.ashbyhq.com/Raindrop/2ae60d74-621b-4bbd-b92b-2f64a2979cc9 (published 2026-08-13 per Ashby's public posting API)
-- **Date researched:** 2026-10-21
+**Your agent sent the event. Your dashboard never got it. Delivery Doctor tells you which hop it died at.**
 
-## Pain points (public sources)
+[![Delivery Doctor demo](docs/demo.gif)](docs/demo.mp4)
 
-Raindrop has no G2 reviews, Reddit threads, or Hacker News threads about it that I could find. Its public GitHub repos are the best first-hand source. The pattern across them: **telemetry that never arrives, with no error to say so.** For a product built to catch silent failures, a silent failure in its own pipe is the worst kind.
+*21 second demo: [docs/demo.mp4](docs/demo.mp4)*
 
-1. **Local-only mode dropped every event.** The Claude Code plugin sent its POSTs to Workshop as fire-and-forget calls, then the process exited before they went out, so Workshop "stays empty forever". Having a cloud key hid the bug. Reported by a user on 2026-08-22, now closed.
-   https://github.com/raindrop-ai/claude-code-plugin/issues/1
-2. **Docker setups get a 403 and see nothing.** Since Workshop v0.1.10, SDK traffic from apps running in Docker (sent to `host.docker.internal`) is rejected by a Host header check, "and telemetry silently never appears in Workshop". It worked in v0.1.8 or earlier, and there is no escape hatch. Opened 2026-07-07, still open.
-   https://github.com/raindrop-ai/workshop/issues/33
-3. **One rejected batch stalled the Go SDK queue.** If the server permanently rejected a trace batch, the SDK resent it on every flush, and "No later spans were sent until the queue overflowed." Fixed in a PR merged 2026-09-30.
-   https://github.com/raindrop-ai/go/pull/12
-4. **The install footprint blocks lean setups.** `raindrop-ai` eagerly imports the Traceloop SDK and about nine provider instrumentation packages even with `useExternalOtel: true`. Installing with `--omit=optional` makes the base package fail to load. Opened 2026-07-17, still open.
-   https://github.com/raindrop-ai/workshop/issues/34
-5. **Install-time outage and Windows failures.** `curl -fsSL https://raindrop.sh/install` could not connect (2026-05-16, closed). Separately, Workshop compiles on Windows/WSL but then errors out (2026-05-25, still open).
-   https://github.com/raindrop-ai/workshop/issues/10 and https://github.com/raindrop-ai/workshop/issues/18
+## The problem
 
-## Proposed feature: Delivery Doctor
+Agent observability SDKs are built so they never get in your way. `track()` returns right away, events sit in a buffer, batches go out in the background, and when something fails the SDK keeps quiet so your app keeps running.
 
-**One thing:** a delivery check, run from the CLI and the dashboard, that proves the events an SDK emits actually landed. When they don't, it says exactly where they stopped.
+The cost is that events vanish without a trace. The process exits before the buffer is flushed. A key expires. A proxy times out. A 1 MB tool output trips a payload limit. A burst overflows the in-memory queue. Your app logs nothing, the SDK logs nothing, and the dashboard just shows fewer events than it should. Nobody can say where they went.
 
-- `raindrop doctor` sends a canary event, a trace, and a tool span, each tagged with a unique ID. It then polls ingest until it can read each one back. Every hop gets a pass or fail: SDK buffer, flush on exit, network or Host check, auth, ingest, and query. This would have caught pains 1, 2 and 3 in the first minute of setup, not after a user went digging in source.
-- Each SDK keeps per-process counters for sent, acked, rejected (with the 4xx reason), and dropped on exit. Raindrop shows these on a "Pipeline health" panel per project.
-- An alert fires when a project that was sending events goes quiet, or when its reject rate jumps. Raindrop already alerts on agent failures, and this alerts on its own data path.
-- `doctor` also prints the resolved dependency mode (Traceloop or direct shipping), so pain 4 shows up as a clear diagnosis, not a load error.
+## What Delivery Doctor does
 
-**Why this role:** the FDE job is to get customers running and debug "across their agents and our platform". Today the first step of that debugging is proving data arrived at all. Delivery Doctor makes that one command, and its failure reports become the product feedback the posting asks for.
+Delivery Doctor sends tagged canary events through the SDK, then reads every one of them back from intake. For each event it lines up two independent records:
 
-## How Karan would build it (each claim mapped to his work)
+- **what the client did**: a delivery ledger the SDK appends to on every state change (buffered, dropped, attempt, retry, split, acked, rejected, failed)
+- **what the server holds**: the intake log, read back over HTTP
 
-| Piece of Delivery Doctor | What Karan has done that maps to it | Project |
+Then it walks the hops in order and names the first one that failed, along with the fix and the raw evidence.
+
+```
+$ python3 -m delivery_doctor check --fail buffer
+Delivery Doctor run 53d0d3eb  injected failure: buffer
+endpoint: http://127.0.0.1:59325
+
+EVENT ID         BUFFERED  SENT  HTTP  LANDED  STOP POINT / DETAIL
+dd-53d0d3eb-000  yes       yes   200   yes     landed: in intake log (1 copy)
+...
+dd-53d0d3eb-009  yes       yes   200   yes     landed: in intake log (1 copy)
+dd-53d0d3eb-010  yes       no    -     no      never sent by client (buffer drop): still in SDK buffer when the process exited
+dd-53d0d3eb-011  yes       no    -     no      never sent by client (buffer drop): still in SDK buffer when the process exited
+
+JSON report: .doctor_runs/53d0d3eb/report.json
+FAIL: 10/12 landed; 2 never sent by client (buffer drop) (fix: call flush() before the process exits, or keep the SDK exit hook on).
+```
+
+## Quickstart
+
+You need Python 3 (tested on 3.13). There are no runtime dependencies, nothing to sign up for, and no API keys. Everything runs on `127.0.0.1`.
+
+```bash
+git clone https://github.com/karank2512/yc-proposal-raindrop.git delivery-doctor
+cd delivery-doctor
+python3 -m delivery_doctor check
+```
+
+A healthy run ends with `PASS: 12/12 events landed and were read back.` and exit code 0. Then break something on purpose:
+
+```bash
+python3 -m delivery_doctor check --fail expired-key
+python3 -m delivery_doctor check --fail too-large --verbose
+python3 -m delivery_doctor watch --fail rate-limit --duration 10
+python3 -m delivery_doctor report --html report.html
+```
+
+## Features
+
+**`check`**: one run, one verdict. It emits N canaries (`--n`, default 12), polls intake until every event the SDK thinks was delivered can be read back, and prints a hop-by-hop table.
+
+- `--json` prints the full report as JSON, for CI and scripts
+- `--verbose` lists every ledger and intake entry under each event, with millisecond offsets
+- `--html PATH` also writes the HTML report
+- `--gzip` has the SDK gzip request bodies
+
+**`watch`**: tails a live emitter and redraws delivery health every second: tracked, landed, lost, and in flight counts, plus a histogram of stop points.
+
+```
+[   3.1s]  tracked 32    landed 5     lost 25    in flight 2
+    rate_limited         ############################## 25
+    landed               ###### 5
+    in_flight            ## 2
+```
+
+By default it starts its own intake and a streaming sample agent (`--duration`, `--rate`, `--interval`). To watch an emitter you started yourself, point it at that emitter's ledger and intake: `watch --ledger sdk_ledger.jsonl --intake http://127.0.0.1:8787`. With `--json` it prints one JSON object per tick and a final report line. Events that are still buffered or being retried count as in flight while the emitter runs, not as lost.
+
+**`report --html out.html`**: a single HTML file you can attach to a ticket. It has the verdict, summary stats, a stop-point histogram with fix hints, and a timeline row per event showing each hop (buffered, attempt, retry, split, acked, intake receipt) at its real time offset. Every row expands to its raw evidence. All CSS and JS is inline and the full report JSON is embedded, so the file works offline. It reads the latest run by default; `--from` takes a run id or a `report.json` path, and `--fail MODE` runs a new check first.
+
+**Exit codes** for every command: `0` every event landed, `1` at least one event was lost, `2` usage error.
+
+## Stop points
+
+| Stop point | Hop | What the evidence shows |
 |---|---|---|
-| Canary events with unique IDs, traced hop by hop and read back | Built approve/deny traces tied to tool call IDs, and evals that score every LLM output 3 ways (fully tested MVP in simulated mode) | Foreman |
-| Retries that never duplicate or stall the queue (pain 3) | Built 6 idempotent collectors tracking 907 companies and 10,585 open postings, with 97.8% run success over 321 runs | tell |
-| Every pass/fail result links to raw evidence (the request, the response, the reject reason) | In tell, every score links to its public-record receipt | tell |
-| Acked writes counted once, and doubtful states held back and not guessed | Exactly-once HubSpot writes, with low-confidence writes held back for a human | RelayIQ |
-| Flush on exit and a durable local buffer, so events survive the process ending (pain 1) | Owns the storage and session-restore layer (team results: 340s to 0.88s median fork, 14.3 GB/s restore) | thaw |
-| Embedding with users and proving the system works against a known baseline | Production retrieval assistant used daily by 60+ staff, cut manual lookup time 40%, evaluated against a golden set | UW-Madison IT |
+| `landed` | intake | Intake log has an accepted record for the id |
+| `rejected` | intake | Intake received it and rejected it; detail is the server's reason (for example `field 'timestamp' has wrong type str`) |
+| `queue_overflow` | sdk | SDK dropped it at `track()` because its in-memory queue was full |
+| `never_sent` | sdk | Buffered but never attempted; the process exited with it still in the buffer |
+| `auth_invalid_key` | auth | HTTP 401, code `invalid_key` |
+| `auth_expired_key` | auth | HTTP 401, code `key_expired` (a different fix from a wrong key, so it's a separate stop point) |
+| `forbidden` | auth | HTTP 403, for example a Host or origin check in front of intake |
+| `rate_limited` | intake | Retries ran out while intake kept answering 429 |
+| `payload_too_large` | intake | HTTP 413 even after the SDK split the batch down to this single event |
+| `send_timeout` | network | No response within the SDK timeout on every attempt |
+| `send_failed_network` | network | Connection errors on every attempt |
+| `send_failed_http` | intake | Any other HTTP error, with status and body |
+| `acked_not_readable` | query | SDK got a 200, but intake has no record (ingest or query path lost it) |
+| `never_tracked` | app | No ledger entry; the app never called `track()` |
 
-## Rough demo plan (a few days)
+## Failure injection
 
-- **Day 1:** Write a small agent app that uses the public `raindrop-ai` TypeScript SDK and sends to a local Workshop. Reproduce two known failures on purpose: exit right after tracking (pain 1), and run the app in Docker against `host.docker.internal` (pain 2).
-- **Day 2:** Write `doctor` as a standalone script. It sends tagged canaries, reads them back from local Workshop, and prints a hop-by-hop table: buffered, flushed, HTTP status, readable.
-- **Day 3:** Add sent/acked/rejected/dropped counters by wrapping the SDK's transport. Add a "went quiet" check over a sliding window, and show the results on a one-page HTML panel.
-- **Day 4:** Record a 2-minute walkthrough. Start in a broken state, run `doctor`, read the diagnosis, apply the fix, run it again, and get all green.
-- **Scope note:** this runs only against local, open-source Workshop. It needs no Raindrop account, no write key, and no paid service.
+Every failure is reproduced for real by the mock SDK, sample agent, or intake. Nothing is faked in the classifier. Pass any of these to `check`, `watch`, or `report` with `--fail`:
 
-## LinkedIn note (under 300 characters)
+| `--fail` | What it simulates | Expected result (12 canaries) |
+|---|---|---|
+| `auth` | SDK configured with a wrong API key | 12 `auth_invalid_key` |
+| `expired-key` | SDK configured with an expired key | 12 `auth_expired_key` |
+| `schema` | every 4th event sends `timestamp` as a string | 9 landed, 3 `rejected` |
+| `buffer` | app exits without `flush()` and without the SDK exit hook | 10 landed, 2 `never_sent` |
+| `network` | SDK points at a port with nothing listening | 12 `send_failed_network` |
+| `rate-limit` | intake answers 429 after the first batch | 5 landed, 7 `rate_limited` |
+| `too-large` | every 6th event carries a 1 MB attachment (limit 256 KB) | 10 landed, 2 `payload_too_large` |
+| `timeout` | intake hangs longer than the SDK's 0.25s timeout | 12 `send_timeout` |
+| `overflow` | SDK queue capped at 8; the app bursts past it | 8 landed, 4 `queue_overflow` |
 
-> Hi, I'm Karan. I built tell: 6 idempotent collectors, 97.8% success over 321 runs. Saw Workshop issues where events drop silently, so I'd love to prototype a check that proves every SDK event landed. Up for a quick chat about the FDE role?
+`python3 -m delivery_doctor check --help` prints the same list.
+
+## How the mock SDK behaves
+
+`mock_raindrop/sdk.py` copies the delivery behavior of real agent telemetry SDKs, so the failures above happen the way they do in production:
+
+- `track()` only buffers. Batches go out when they reach `batch_size` events or `max_batch_bytes`, or on `flush()`.
+- An `atexit` hook flushes on normal exit. Turn it off, or kill the process hard, and the buffer tail is lost.
+- Retries use exponential backoff with jitter on connection errors, timeouts, 5xx, and 429. A 429's `Retry-After` overrides the backoff.
+- Other 4xx responses are not retried, so one bad batch cannot stall the queue.
+- A 413 splits the batch in half and retries each half, so one oversized event only takes itself down.
+- The queue is bounded (`max_queue_size`). Events tracked while it is full are dropped and counted.
+- Optional gzip request bodies. The ledger records each event's encoded size and each request's wire size.
+
+The intake (`mock_raindrop/server.py`) validates a small event schema, dedupes accepted ids so retries never double count, and has knobs for 503s, rate limits, body size limits, and hung requests. Run it by itself with `python3 -m mock_raindrop.server --port 8787`.
+
+## Project layout
+
+| Path | What it is |
+|---|---|
+| `delivery_doctor/doctor.py` | Runs a check and classifies each event from the ledger and the intake log |
+| `delivery_doctor/watch.py` | Watch mode |
+| `delivery_doctor/html_report.py` | Single-file HTML report |
+| `delivery_doctor/__main__.py` | CLI |
+| `mock_raindrop/sdk.py` | Mini SDK with the delivery ledger |
+| `mock_raindrop/server.py` | Local mock intake server |
+| `mock_raindrop/sample_agent.py` | Sample app that emits tagged canaries, in a burst or as a stream |
+| `tests/` | Pytest suite; each failure mode is pinned to its stop point |
+
+Each run's artifacts (SDK ledger, intake log, `report.json`) are kept under `.doctor_runs/<run_id>/`.
+
+## Running the tests
+
+```bash
+python3 -m pip install pytest
+python3 -m pytest -q
+```
+
+## Limits
+
+- **This is a prototype.** It shows the approach working end to end. It is not a hardened tool.
+- **The intake is a mock.** It runs against a local stand-in for an observability backend, not a real service. The SDK is a small model of how such SDKs deliver events, not any vendor's actual SDK.
+- **Not affiliated with Raindrop.** The `mock_raindrop` package name only describes the kind of pipeline being modeled. This project is not made, reviewed, or endorsed by Raindrop or any other vendor.
+- **The ledger is the key assumption.** Pinpointing client-side hops depends on the SDK writing a delivery ledger. Real SDKs would need that hook (or equivalent counters) added.
+- **One process, one machine.** Multi-process apps, serverless runtimes, and real network paths (proxies, Docker host names) are modeled, not tested.
