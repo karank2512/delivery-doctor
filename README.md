@@ -6,7 +6,7 @@
 
 *15 second demo: [docs/demo.mp4](docs/demo.mp4)*
 
-One idea: agent telemetry can vanish in transit without a single error. The SDK buffers the event, the process exits 0, the logs stay clean, and the dashboard just comes up short. Delivery Doctor proves whether each event actually arrived at intake, and when one did not, it names the exact hop where it stopped and the fix. One command: `python3 -m delivery_doctor check`. This is a prototype that runs against a local mock intake; it is not affiliated with Raindrop.
+One idea: agent telemetry can vanish in transit without a single error. The SDK buffers the event, the process exits 0, the logs stay clean, and the dashboard just comes up short. Delivery Doctor proves whether each event actually arrived at intake, and when one did not, it names the exact hop where it stopped and the fix. One command: `python3 -m delivery_doctor check`.
 
 ## What this is (and what it is not)
 
@@ -29,6 +29,8 @@ Delivery Doctor sends tagged canary events through the SDK, then reads every one
 
 Then it walks the hops in order and names the first one that failed, along with the fix and the raw evidence.
 
+**The one hook this takes is the delivery ledger.** If the SDK records each state change an event goes through, pinpointing the client-side hop stops being a guess and becomes a lookup. That ledger (or equivalent counters) is the one thing a production SDK would need to add, and it is cheap: an append-only line per state change, no behavior change, no hot-path cost.
+
 ```
 $ python3 -m delivery_doctor check --fail buffer
 Delivery Doctor run 53d0d3eb  injected failure: buffer
@@ -50,7 +52,7 @@ FAIL: 10/12 landed; 2 never sent by client (buffer drop) (fix: call flush() befo
 You need Python 3 (tested on 3.13). There are no runtime dependencies, nothing to sign up for, and no API keys. Everything runs on `127.0.0.1`.
 
 ```bash
-git clone https://github.com/karank2512/yc-proposal-raindrop.git delivery-doctor
+git clone https://github.com/karank2512/delivery-doctor.git
 cd delivery-doctor
 python3 -m delivery_doctor check
 ```
@@ -166,5 +168,4 @@ python3 -m pytest -q
 - **This is a prototype.** It shows the approach working end to end. It is not a hardened tool.
 - **The intake is a mock.** It runs against a local stand-in for an observability backend, not a real service. The SDK is a small model of how such SDKs deliver events, not any vendor's actual SDK.
 - **Not affiliated with Raindrop.** The `mock_raindrop` package name only describes the kind of pipeline being modeled. This project is not made, reviewed, or endorsed by Raindrop or any other vendor.
-- **The ledger is the key assumption.** Pinpointing client-side hops depends on the SDK writing a delivery ledger. Real SDKs would need that hook (or equivalent counters) added.
 - **One process, one machine.** Multi-process apps, serverless runtimes, and real network paths (proxies, Docker host names) are modeled, not tested.
