@@ -37,6 +37,12 @@ JSON report: .doctor_runs/53d0d3eb/report.json
 FAIL: 10/12 landed; 2 never sent by client (buffer drop) (fix: call flush() before the process exits, or keep the SDK exit hook on).
 ```
 
+## What this is (and what it is not)
+
+Delivery Doctor is a transport verifier. It answers one question: did the telemetry your agent emitted actually arrive at intake, and if not, exactly where did it stop?
+
+It is not a local debugger. Raindrop's [Workshop](https://github.com/raindrop-ai/workshop), their open-source local debugger, already covers that ground: it streams every token, tool call, and span from your agent into a live local UI and lets your coding agent write evals against the traces. The two tools complement each other: Workshop shows you what your agent did locally, Delivery Doctor proves whether the data about it made it to the backend, and names the hop where it stopped when it did not.
+
 ## Quickstart
 
 You need Python 3 (tested on 3.13). There are no runtime dependencies, nothing to sign up for, and no API keys. Everything runs on `127.0.0.1`.
