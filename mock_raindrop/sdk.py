@@ -14,6 +14,10 @@ Delivery behavior:
   - 413 splits the batch in half and retries each half, so one oversized
     event only takes itself down
   - a bounded in-memory queue; events tracked while it is full are dropped
+  - never raises into the app: a malformed response, a bogus Retry-After, or
+    an unwritable ledger is recorded (or ignored) instead of crashing the caller
+  - response bodies are read with a cap, and loopback endpoints bypass any
+    HTTP(S)_PROXY so local canaries never leave the machine
 
 The one addition is a delivery ledger: a JSONL file the SDK appends to on
 every state change (buffered, dropped, attempt, retry, split, acked, rejected,
@@ -23,12 +27,29 @@ the doctor can read it.
 
 import atexit
 import gzip
+import http.client
+import ipaddress
 import json
+import math
 import random
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+
+MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_ERROR_BODY_BYTES = 4096
+
+
+def _is_loopback(host):
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address((host or "").strip("[]"))
+    except ValueError:
+        return False
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
 
 
 def event_size(event):
@@ -51,6 +72,10 @@ class Client:
         self.timeout = timeout
         self.gzip = gzip
         self.ledger_path = ledger_path
+        self.ledger_errors = 0
+        host = urllib.parse.urlsplit(self.endpoint).hostname
+        self._opener = urllib.request.build_opener(
+            *([urllib.request.ProxyHandler({})] if _is_loopback(host) else []))
         self.buffer = []
         self.counters = {"buffered": 0, "dropped": 0, "sent": 0, "acked": 0,
                          "rejected": 0, "failed": 0, "retries": 0, "bytes_sent": 0}
@@ -61,9 +86,13 @@ class Client:
         if not self.ledger_path:
             return
         now = time.time()
-        with open(self.ledger_path, "a") as f:
-            for event_id in event_ids:
-                f.write(json.dumps({"event_id": event_id, "stage": stage, "t": now, **detail}) + "\n")
+        lines = "".join(json.dumps({"event_id": event_id, "stage": stage, "t": now, **detail},
+                                   default=str) + "\n" for event_id in event_ids)
+        try:
+            with open(self.ledger_path, "a") as f:
+                f.write(lines)  # one write per state change keeps lines whole
+        except OSError:
+            self.ledger_errors += 1  # observability must never take the app down
 
     def track(self, event):
         event_id = event.get("event_id")
@@ -99,8 +128,8 @@ class Client:
             self._send(self._next_batch())
 
     def _wait(self, attempt, retry_after=None):
-        if retry_after is not None:
-            return min(retry_after, self.max_backoff)
+        if retry_after is not None and math.isfinite(retry_after):
+            return min(max(retry_after, 0.0), self.max_backoff)
         base = min(self.backoff * 2 ** (attempt - 1), self.max_backoff)
         return base * (0.5 + random.random() / 2)
 
@@ -121,10 +150,18 @@ class Client:
             req = urllib.request.Request(self.endpoint, data=body, method="POST", headers=headers)
             retry_after = None
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    result = json.loads(resp.read())
+                with self._opener.open(req, timeout=self.timeout) as resp:
+                    raw = resp.read(MAX_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    raise ValueError("response body too large")
+                result = json.loads(raw)
+                if not isinstance(result, dict) or not isinstance(result.get("rejected", []), list):
+                    raise ValueError("response is not an object with a 'rejected' list")
             except urllib.error.HTTPError as e:
-                text = e.read().decode(errors="replace")
+                try:
+                    text = e.read(MAX_ERROR_BODY_BYTES).decode(errors="replace")
+                except (OSError, ValueError):
+                    text = ""
                 error = {"kind": "http", "status": e.code, "body": text}
                 if e.code == 413 and len(batch) > 1:
                     half = len(batch) // 2
@@ -134,23 +171,26 @@ class Client:
                     return
                 if e.code == 429:
                     try:
-                        retry_after = float(e.headers.get("Retry-After", ""))
-                    except ValueError:
+                        retry_after = float((e.headers or {}).get("Retry-After", ""))
+                    except (TypeError, ValueError):
                         retry_after = None
                 elif e.code < 500:
                     break  # 4xx will not get better on retry, so do not stall the queue
             except (socket.timeout, TimeoutError) as e:
                 error = {"kind": "timeout", "error": f"no response within {self.timeout}s"}
-            except (urllib.error.URLError, OSError) as e:
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
                 reason = getattr(e, "reason", e)
                 if isinstance(reason, (socket.timeout, TimeoutError)):
                     error = {"kind": "timeout", "error": f"no response within {self.timeout}s"}
                 else:
                     error = {"kind": "connection", "error": str(reason)}
+            except ValueError as e:  # 2xx with a body we cannot use; treat like a 5xx
+                error = {"kind": "bad_response", "status": 200, "error": f"unusable 200 response: {e}"}
             else:
                 self.counters["sent"] += len(batch)
                 self.counters["bytes_sent"] += len(body)
-                rejected = {r["event_id"]: r["reason"] for r in result.get("rejected", [])}
+                rejected = {r.get("event_id"): str(r.get("reason", "rejected"))
+                            for r in result.get("rejected", []) if isinstance(r, dict)}
                 for event_id in ids:
                     if event_id in rejected:
                         self.counters["rejected"] += 1

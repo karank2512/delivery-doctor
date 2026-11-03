@@ -14,6 +14,7 @@ at --rate per second for that many seconds instead, which is what
 """
 
 import argparse
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -38,17 +39,28 @@ def make_event(run_id, i, args):
             "user_id": "doctor", "timestamp": ts, "properties": props}
 
 
+def _positive(kind):
+    def parse(text):
+        value = kind(text)
+        if not (value > 0 and math.isfinite(value)):
+            raise argparse.ArgumentTypeError(f"must be a positive number, got {text}")
+        return value
+    return parse
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--endpoint", required=True)
     ap.add_argument("--api-key", required=True)
     ap.add_argument("--run-id", required=True)
-    ap.add_argument("--n", type=int, default=12)
-    ap.add_argument("--duration", type=float, help="stream for this many seconds instead of --n")
-    ap.add_argument("--rate", type=float, default=20.0, help="events per second when streaming")
-    ap.add_argument("--batch-size", type=int, default=5)
-    ap.add_argument("--max-queue", type=int, default=1000)
-    ap.add_argument("--timeout", type=float, default=2.0)
+    ap.add_argument("--n", type=_positive(int), default=12)
+    ap.add_argument("--duration", type=_positive(float),
+                    help="stream for this many seconds instead of --n")
+    ap.add_argument("--rate", type=_positive(float), default=20.0,
+                    help="events per second when streaming")
+    ap.add_argument("--batch-size", type=_positive(int), default=5)
+    ap.add_argument("--max-queue", type=_positive(int), default=1000)
+    ap.add_argument("--timeout", type=_positive(float), default=2.0)
     ap.add_argument("--gzip", action="store_true")
     ap.add_argument("--ledger", required=True)
     ap.add_argument("--bad-timestamp-every", type=int, default=0)

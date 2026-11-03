@@ -16,6 +16,9 @@ timeout).
 Every received event is appended to a JSONL log, accepted or rejected, so the
 log is the source of truth for "did it land". Accepted event ids are deduped,
 so a retried batch never lands twice.
+
+It only ever binds 127.0.0.1, sets a socket timeout per connection, caps the
+bytes it will read (and decompress), and caps how many ids one GET may ask for.
 """
 
 import argparse
@@ -23,12 +26,20 @@ import gzip
 import json
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 DEFAULT_API_KEY = "rd_local_test_key"
 EXPIRED_API_KEY = "rd_expired_test_key"
 DEFAULT_MAX_BODY_BYTES = 256 * 1024
+# Bodies above the advertised limit are still drained (so the client sees the
+# 413 rather than a reset) up to this hard cap; beyond it the connection is cut.
+HARD_MAX_BODY_BYTES = 16 * 1024 * 1024
+MAX_DECOMPRESSED_BYTES = 8 * 1024 * 1024
+MAX_EVENTS_PER_BATCH = 1000
+MAX_GET_IDS = 1000
+SOCKET_TIMEOUT_S = 15
 
 # field name -> required type
 SCHEMA = {"event_id": str, "event": str, "user_id": str, "timestamp": (int, float)}
@@ -79,6 +90,8 @@ def make_handler(log, api_key, flaky_requests=0, rate_limit_after=None, retry_af
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = SOCKET_TIMEOUT_S  # a stalled client cannot pin a thread forever
+
         def log_message(self, *args):
             pass
 
@@ -111,7 +124,14 @@ def make_handler(log, api_key, flaky_requests=0, rate_limit_after=None, retry_af
                 return  # drop the connection without a response or processing
             if not self._authed():
                 return
-            length = int(self.headers.get("Content-Length", 0))
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = -1
+            if length < 0 or length > HARD_MAX_BODY_BYTES:
+                self.close_connection = True
+                return self._reply(413 if length > 0 else 411,
+                                   {"error": "missing, invalid, or absurd Content-Length"})
             raw = self.rfile.read(length)  # drain first so the client sees the 413, not a reset
             if length > max_body_bytes:
                 return self._reply(413, {"error": f"body is {length} bytes, limit is {max_body_bytes}"})
@@ -125,14 +145,23 @@ def make_handler(log, api_key, flaky_requests=0, rate_limit_after=None, retry_af
                 state["posts_ok"] += 1
             try:
                 if self.headers.get("Content-Encoding") == "gzip":
-                    raw = gzip.decompress(raw)
+                    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    raw = d.decompress(raw, MAX_DECOMPRESSED_BYTES)
+                    if d.unconsumed_tail:
+                        return self._reply(413, {"error": "decompressed body too large"})
                 events = json.loads(raw)["events"]
-            except (OSError, ValueError, KeyError, TypeError):
+                if not isinstance(events, list):
+                    raise TypeError("events is not a list")
+            except (OSError, ValueError, KeyError, TypeError, zlib.error):
                 return self._reply(400, {"error": "body must be {\"events\": [...]}"})
+            if len(events) > MAX_EVENTS_PER_BATCH:
+                return self._reply(413, {"error": f"more than {MAX_EVENTS_PER_BATCH} events in one batch"})
 
             accepted, rejected = [], []
             for event in events:
                 event_id = event.get("event_id") if isinstance(event, dict) else None
+                if not isinstance(event_id, str):
+                    event_id = None
                 reason = validate(event)
                 if reason:
                     log.append({"status": "rejected", "event_id": event_id,
@@ -149,8 +178,10 @@ def make_handler(log, api_key, flaky_requests=0, rate_limit_after=None, retry_af
                 return self._reply(404, {"error": "not found"})
             if not self._authed():
                 return
-            ids = parse_qs(url.query).get("ids", [""])[0].split(",")
-            self._reply(200, {"entries": log.lookup([i for i in ids if i])})
+            ids = [i for i in parse_qs(url.query).get("ids", [""])[0].split(",") if i]
+            if len(ids) > MAX_GET_IDS:
+                return self._reply(400, {"error": f"at most {MAX_GET_IDS} ids per request"})
+            self._reply(200, {"entries": log.lookup(ids)})
 
     return Handler
 
@@ -172,12 +203,14 @@ class IntakeServer:
         return self
 
     def __exit__(self, *exc):
-        self.httpd.shutdown()
+        if self.thread.is_alive():
+            self.httpd.shutdown()
         self.httpd.server_close()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Run the mock Raindrop intake server.")
+    ap = argparse.ArgumentParser(
+        description="Run the mock Raindrop intake server. Binds 127.0.0.1 only.")
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--log", default="intake_log.jsonl")
     ap.add_argument("--rate-limit-after", type=int, help="answer 429 after N accepted requests")

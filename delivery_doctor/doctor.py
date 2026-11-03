@@ -12,20 +12,43 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.request
+import urllib.parse
 import uuid
 from collections import Counter
 
+from delivery_doctor.safety import (DoctorError, atomic_write, get_json, private_makedirs,
+                                    redact, redact_url, safe_text)
 from mock_raindrop.sample_agent import event_ids
 from mock_raindrop.server import DEFAULT_API_KEY, EXPIRED_API_KEY, IntakeServer
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUNS_DIR = os.path.join(REPO_ROOT, ".doctor_runs")
+
+
+def runs_dir():
+    """Where run artifacts go: $DELIVERY_DOCTOR_RUNS_DIR, else <repo>/.doctor_runs."""
+    return os.path.abspath(os.environ.get("DELIVERY_DOCTOR_RUNS_DIR")
+                           or os.path.join(REPO_ROOT, ".doctor_runs"))
+
+
+WRONG_API_KEY = "rd_wrong_key"
+MOCK_KEYS = (DEFAULT_API_KEY, EXPIRED_API_KEY, WRONG_API_KEY)
+RUNS_DIR = runs_dir()  # value at import time; code paths call runs_dir()
+
+# Input bounds. Wide enough for real use, tight enough that a typo cannot hang
+# the machine or produce a vacuous verdict.
+MIN_EVENTS, MAX_EVENTS = 1, 5000
+MAX_EVENT_ID_LEN = 200
+MAX_LEDGER_BYTES = 256 * 1024 * 1024
+MAX_LEDGER_IDS = 100_000
+MAX_LEDGER_LINE = 1024 * 1024
+READ_TIMEOUT_S = 5.0  # per intake read-back request
+EMITTER_TIMEOUT_S = 120.0  # wall clock for the canary emitter in `check`
+LEDGER_STAGES = {"buffered", "dropped", "attempt", "retry", "split", "acked", "rejected", "failed"}
 
 # demo failure -> (what it simulates, sample agent flags, intake server knobs)
 FAILURES = {
     "auth": ("SDK configured with a wrong API key",
-             ["--api-key", "rd_wrong_key"], {}),
+             ["--api-key", WRONG_API_KEY], {}),
     "expired-key": ("SDK configured with an API key that has expired",
                     ["--api-key", EXPIRED_API_KEY], {}),
     "schema": ("every 4th event sends timestamp as a string",
@@ -91,42 +114,103 @@ def free_port():
         return s.getsockname()[1]
 
 
-def read_ledger(path):
-    """Ledger entries grouped by event id. Skips a partial last line (writer still going)."""
-    by_id = {}
-    if os.path.exists(path):
-        with open(path) as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                by_id.setdefault(entry["event_id"], []).append(entry)
-    return by_id
+def valid_event_id(event_id):
+    return (isinstance(event_id, str) and 0 < len(event_id) <= MAX_EVENT_ID_LEN
+            and "," not in event_id and safe_text(event_id) == event_id)
 
 
-def query_intake(url, ids, api_key=DEFAULT_API_KEY, chunk=200):
+def read_ledger(path, stats=None):
+    """Ledger entries grouped by event id.
+
+    Tolerant by design: the writer may still be appending (partial last line),
+    and in attach mode the file is not ours. Lines that are not JSON objects
+    with a usable event_id and a known stage are skipped and counted in
+    stats["skipped"]. Oversized files or too many ids raise DoctorError.
+    """
+    stats = stats if stats is not None else {}
+    stats.setdefault("skipped", 0)
     by_id = {}
-    ids = list(ids)
-    for start in range(0, len(ids), chunk):
-        part = ",".join(ids[start:start + chunk])
-        req = urllib.request.Request(f"{url}/v1/events?ids={part}", headers={"X-Api-Key": api_key})
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            entries = json.loads(resp.read())["entries"]
-        for entry in entries:
+    if not os.path.exists(path):
+        return by_id
+    if not os.path.isfile(path):
+        raise DoctorError(f"ledger {path} is not a regular file")
+    if os.path.getsize(path) > MAX_LEDGER_BYTES:
+        raise DoctorError(f"ledger {path} is larger than {MAX_LEDGER_BYTES} bytes")
+    with open(path, "rb") as f:
+        for raw in f:
+            if len(raw) > MAX_LEDGER_LINE:
+                stats["skipped"] += 1
+                continue
+            try:
+                entry = json.loads(raw.decode("utf-8"))
+            except ValueError:  # includes UnicodeDecodeError and a partial last line
+                if raw.endswith(b"\n"):
+                    stats["skipped"] += 1
+                continue
+            if (not isinstance(entry, dict) or not valid_event_id(entry.get("event_id"))
+                    or entry.get("stage") not in LEDGER_STAGES):
+                stats["skipped"] += 1
+                continue
+            _normalize_entry(entry)
+            if entry["event_id"] not in by_id and len(by_id) >= MAX_LEDGER_IDS:
+                raise DoctorError(f"ledger {path} has more than {MAX_LEDGER_IDS} event ids")
             by_id.setdefault(entry["event_id"], []).append(entry)
     return by_id
 
 
+_NUMERIC_FIELDS = {"t": (int, float), "bytes": int, "attempt": int, "attempts": int,
+                   "status": int, "queue_size": int, "wait": (int, float)}
+
+
+def _normalize_entry(entry):
+    """Drop numeric fields with the wrong type, so a foreign ledger can't crash classification."""
+    for key, kind in _NUMERIC_FIELDS.items():
+        if key in entry and (isinstance(entry[key], bool) or not isinstance(entry[key], kind)):
+            del entry[key]
+    if "t" in entry and not (-1e12 < entry["t"] < 1e12):
+        del entry["t"]
+    for key in ("kind", "error", "body", "reason"):
+        if key in entry and not isinstance(entry[key], str):
+            entry[key] = str(entry[key])
+
+
+def query_intake(url, ids, api_key=DEFAULT_API_KEY, chunk=200, timeout=READ_TIMEOUT_S):
+    """Read back what intake holds for ids. Raises DoctorError if intake can't be read.
+
+    Only well-formed entries for ids we asked about are kept, so a misbehaving
+    intake cannot inject findings for other events.
+    """
+    by_id = {}
+    ids = list(ids)
+    wanted = set(ids)
+    for start in range(0, len(ids), chunk):
+        query = urllib.parse.urlencode({"ids": ",".join(ids[start:start + chunk])}, safe=",")
+        doc = get_json(f"{url}/v1/events?{query}", {"X-Api-Key": api_key}, timeout,
+                       secrets=(api_key,))
+        entries = doc.get("entries") if isinstance(doc, dict) else None
+        if not isinstance(entries, list):
+            raise DoctorError("intake read-back response has no 'entries' list")
+        for entry in entries:
+            if (isinstance(entry, dict) and isinstance(entry.get("event_id"), str)
+                    and entry.get("event_id") in wanted
+                    and entry.get("status") in ("accepted", "rejected")):
+                by_id.setdefault(entry["event_id"], []).append(entry)
+    return by_id
+
+
 def _failure_stop(fail):
-    if fail["kind"] == "connection":
-        return "send_failed_network", f"{fail['error']} after {fail['attempts']} attempts"
-    if fail["kind"] == "timeout":
-        return "send_timeout", f"{fail['error']} after {fail['attempts']} attempts"
+    kind, attempts = fail.get("kind"), fail.get("attempts", "?")
+    if kind == "connection":
+        return "send_failed_network", f"{fail.get('error', 'connection error')} after {attempts} attempts"
+    if kind == "timeout":
+        return "send_timeout", f"{fail.get('error', 'timed out')} after {attempts} attempts"
+    if kind != "http" or not isinstance(fail.get("status"), int):
+        return "send_failed_http", f"{fail.get('error', 'unusable response')} after {attempts} attempts"
     status, body = fail["status"], fail.get("body", "")
+    body = safe_text(body, limit=500)
     try:
         code = json.loads(body).get("code")
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         code = None
     if status == 401:
         stop = "auth_expired_key" if code == "key_expired" else "auth_invalid_key"
@@ -136,8 +220,8 @@ def _failure_stop(fail):
     if status == 413:
         return "payload_too_large", f"HTTP 413 {body}"
     if status == 429:
-        return "rate_limited", f"HTTP 429 after {fail['attempts']} attempts"
-    return "send_failed_http", f"HTTP {status} after {fail['attempts']} attempts"
+        return "rate_limited", f"HTTP 429 after {attempts} attempts"
+    return "send_failed_http", f"HTTP {status} after {attempts} attempts"
 
 
 def classify(event_id, ledger, server, live=False):
@@ -149,8 +233,8 @@ def classify(event_id, ledger, server, live=False):
     stages = {}
     for e in ledger:
         stages[e["stage"]] = e  # keep the last entry per stage
-    accepted = [e for e in server if e["status"] == "accepted"]
-    rejected = [e for e in server if e["status"] == "rejected"]
+    accepted = [e for e in server if e.get("status") == "accepted"]
+    rejected = [e for e in server if e.get("status") == "rejected"]
     attempts = [e for e in ledger if e["stage"] == "attempt"]
     http_status = None
     for e in ledger:
@@ -169,12 +253,13 @@ def classify(event_id, ledger, server, live=False):
     evidence = {"ledger": ledger, "intake": [_slim(e) for e in server]}
 
     if accepted:
-        stop, detail = "landed", f"in intake log ({len(accepted)} copy)"
+        copies = len(accepted)
+        stop, detail = "landed", f"in intake log ({copies} cop{'y' if copies == 1 else 'ies'})"
     elif rejected:
-        stop, detail = "rejected", rejected[-1]["reason"]
+        stop, detail = "rejected", safe_text(rejected[-1].get("reason", "no reason given"), 500)
     elif "dropped" in stages:
         stop = "queue_overflow"
-        detail = f"queue already held {stages['dropped']['queue_size']} events when track() was called"
+        detail = f"queue already held {stages['dropped'].get('queue_size')} events when track() was called"
     elif "failed" in stages:
         stop, detail = _failure_stop(stages["failed"])
     elif "acked" in stages:
@@ -204,12 +289,17 @@ def verdict_line(findings):
     total = len(findings)
     counts = Counter(f["stop_point"] for f in findings)
     landed = counts.pop("landed", 0)
+    if total == 0:
+        return "FAIL: no events were tracked, so nothing was verified."
     if not counts:
         return f"PASS: {landed}/{total} events landed and were read back."
     parts = []
     for stop, n in counts.most_common():
         label, hint = STOP_POINTS[stop]
-        parts.append(f"{n} {label} (fix: {hint})")
+        if stop == "in_flight":
+            parts.append(f"{n} still in flight when watching stopped (not proven either way)")
+        else:
+            parts.append(f"{n} {label} (fix: {hint})")
     return f"FAIL: {landed}/{total} landed; " + "; ".join(parts) + "."
 
 
@@ -246,7 +336,7 @@ def build_report(run_id, fail, endpoint, ids, findings, workdir, **extra):
         "total": len(ids),
         "landed": landed,
         "lost": len(ids) - landed,
-        "ok": landed == len(ids),
+        "ok": bool(ids) and landed == len(ids),
         "counts": dict(counts),
         "by_hop": dict(Counter(f["hop"] for f in findings if f["stop_point"] != "landed")),
         "attempts": sum(f["attempts"] for f in findings),
@@ -259,21 +349,50 @@ def build_report(run_id, fail, endpoint, ids, findings, workdir, **extra):
     }
 
 
-def write_report(report, workdir):
+def sanitize_report(report, secrets=()):
+    """Mask secrets everywhere in the report (evidence, stderr, endpoint) before it is persisted.
+
+    The mock's well-known test keys are masked too, so artifacts never carry
+    any key, real or fake.
+    """
+    secrets = tuple(secrets) + MOCK_KEYS
+    clean = redact(report, secrets)
+    if isinstance(clean.get("endpoint"), str):
+        clean["endpoint"] = redact_url(clean["endpoint"])
+    return clean
+
+
+def write_report(report, workdir, secrets=()):
+    """Redact, then write report.json atomically. Mutates report in place to match the file."""
     path = os.path.join(workdir, "report.json")
     report["artifacts"]["report"] = path
-    with open(path, "w") as f:
-        json.dump(report, f, indent=2)
+    clean = sanitize_report(report, secrets)
+    report.clear()
+    report.update(clean)
+    atomic_write(path, json.dumps(report, indent=2))
     return path
 
 
-def run_check(n=12, fail=None, workdir=None, timeout=2.0, gzip=False):
-    """Run one full check. Returns the JSON-serializable report."""
+def check_n(n):
+    if isinstance(n, bool) or not isinstance(n, int) or not MIN_EVENTS <= n <= MAX_EVENTS:
+        raise DoctorError(f"--n must be an integer from {MIN_EVENTS} to {MAX_EVENTS}, got {n!r}")
+
+
+def run_check(n=12, fail=None, workdir=None, timeout=2.0, gzip=False,
+              emitter_timeout=EMITTER_TIMEOUT_S):
+    """Run one full check. Returns the JSON-serializable, redacted report.
+
+    Raises DoctorError when the check itself cannot produce a trustworthy
+    verdict: bad input, the emitter hung or crashed, or intake could not be
+    read back. No report.json is written in that case; the ledger and intake
+    log stay in the run directory for inspection.
+    """
     if fail not in (None,) + FAIL_MODES:
         raise ValueError(f"unknown fail mode {fail!r}")
+    check_n(n)
     run_id = uuid.uuid4().hex[:8]
-    workdir = workdir or os.path.join(RUNS_DIR, run_id)
-    os.makedirs(workdir, exist_ok=True)
+    workdir = workdir or os.path.join(runs_dir(), run_id)
+    private_makedirs(workdir)
     ledger_path = os.path.join(workdir, "sdk_ledger.jsonl")
     ids = event_ids(run_id, n)
 
@@ -281,10 +400,20 @@ def run_check(n=12, fail=None, workdir=None, timeout=2.0, gzip=False):
     with IntakeServer(os.path.join(workdir, "intake_log.jsonl"), **server_knobs(fail)) as server:
         endpoint = f"http://127.0.0.1:{free_port()}" if fail == "network" else server.url
         cmd = emitter_cmd(endpoint, run_id, ledger_path, fail=fail, n=n, gzip=gzip)
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=60)
+        try:
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True,
+                                  timeout=emitter_timeout)
+        except subprocess.TimeoutExpired:
+            raise DoctorError(f"canary emitter did not finish within {emitter_timeout:.0f}s; "
+                              f"partial ledger kept at {ledger_path}")
+        ledger_stats = {}
+        ledger = read_ledger(ledger_path, ledger_stats)
+        if proc.returncode != 0:
+            tail = safe_text(redact(proc.stderr, MOCK_KEYS)[-1000:])
+            raise DoctorError(f"canary emitter exited with code {proc.returncode}, so the run "
+                              f"proves nothing about delivery. stderr tail: {tail}")
 
         # Poll only for ids the SDK believes reached the server, so failed ids don't stall us.
-        ledger = read_ledger(ledger_path)
         expect = [i for i in ids if any(e["stage"] in ("acked", "rejected") for e in ledger.get(i, []))]
         deadline = time.time() + timeout
         found = query_intake(server.url, ids)
@@ -295,17 +424,20 @@ def run_check(n=12, fail=None, workdir=None, timeout=2.0, gzip=False):
     findings = [classify(i, ledger.get(i, []), found.get(i, [])) for i in ids]
     report = build_report(run_id, fail, endpoint, ids, findings, workdir,
                           gzip=gzip, started_at=started, duration_s=round(time.time() - started, 3),
-                          emitter_exit_code=proc.returncode, emitter_stderr=proc.stderr[-2000:])
+                          emitter_exit_code=proc.returncode,
+                          emitter_stderr=safe_text(redact(proc.stderr, MOCK_KEYS)[-2000:]),
+                          ledger_lines_skipped=ledger_stats["skipped"])
     write_report(report, workdir)
     return report
 
 
-def latest_report(runs_dir=RUNS_DIR):
-    """Path to the most recent report.json under .doctor_runs, or None."""
-    if not os.path.isdir(runs_dir):
+def latest_report(directory=None):
+    """Path to the most recent report.json under the runs directory, or None."""
+    directory = directory or runs_dir()
+    if not os.path.isdir(directory):
         return None
-    paths = [os.path.join(runs_dir, d, "report.json") for d in os.listdir(runs_dir)]
-    paths = [p for p in paths if os.path.exists(p)]
+    paths = [os.path.join(directory, d, "report.json") for d in os.listdir(directory)]
+    paths = [p for p in paths if os.path.isfile(p)]
     return max(paths, key=os.path.getmtime) if paths else None
 
 
@@ -318,7 +450,7 @@ def render_table(report, verbose=False):
         h = f["hops"]
         rows.append((f["event_id"], yn(h["buffered"]), yn(h["sent"]),
                      str(h["http_status"] or "-"), yn(h["landed"]),
-                     f"{f['label']}: {f['detail']}"))
+                     safe_text(f"{f['label']}: {f['detail']}")))
     widths = [max(len(r[i]) for r in rows) for i in range(5)]
     lines = []
     for i, r in enumerate(rows):
@@ -335,7 +467,7 @@ def evidence_lines(finding, indent="    "):
     for e in finding["evidence"]["ledger"]:
         rel = f"+{(e['t'] - t0) * 1000:6.0f}ms" if t0 is not None and "t" in e else " " * 9
         extra = ", ".join(f"{k}={v}" for k, v in e.items() if k not in ("event_id", "stage", "t"))
-        out.append(f"{indent}{rel}  sdk     {e['stage']:<9} {extra}")
+        out.append(safe_text(f"{indent}{rel}  sdk     {e['stage']:<9} {extra}"))
     for e in finding["evidence"]["intake"]:
-        out.append(f"{indent}{'':9}  intake  {e['status']:<9} {e.get('reason', '')}")
+        out.append(safe_text(f"{indent}{'':9}  intake  {e['status']:<9} {e.get('reason', '')}"))
     return out
