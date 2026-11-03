@@ -6,6 +6,8 @@
 
 *15 second demo: [docs/demo.mp4](docs/demo.mp4). Its terminal scene shows the output of the injected buffer-drop case, `check --fail buffer`; a plain `check` on a healthy setup passes.*
 
+**Scope:** This is a hardened local diagnostic prototype, not a production-validated integration. The included SDK and intake are mocks. No real vendor SDK, backend read-back API, or production overhead has been validated. See [Readiness](#readiness).
+
 One idea: agent telemetry can vanish in transit without a single error. The SDK buffers the event, the process exits 0, the logs stay clean, and the dashboard just comes up short. Delivery Doctor proves whether each event actually arrived at intake, and when one did not, it names the exact hop where it stopped and the fix. One command: `python3 -m delivery_doctor check`.
 
 ## What this is (and what it is not)
@@ -154,7 +156,7 @@ Every failure is reproduced for real by the mock SDK, sample agent, or intake. N
 
 ## How the mock SDK behaves
 
-`mock_raindrop/sdk.py` copies the delivery behavior of real agent telemetry SDKs, so the failures above happen the way they do in production:
+`mock_raindrop/sdk.py` models common delivery patterns in telemetry SDKs. These examples demonstrate failure mechanisms in the local model; they do not establish how a particular production SDK behaves:
 
 - `track()` only buffers. Batches go out when they reach `batch_size` events or `max_batch_bytes`, or on `flush()`.
 - An `atexit` hook flushes on normal exit. Turn it off, or kill the process hard, and the buffer tail is lost.
