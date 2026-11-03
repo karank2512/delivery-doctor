@@ -3,13 +3,23 @@
 No external CSS, fonts, scripts, or images: the raw report JSON is embedded
 in the page, so the single file can be attached to a ticket or sent to
 someone as is.
+
+The renderer treats the report as untrusted (`report --from` accepts any
+file): every string is escaped, every number is coerced, the embedded JSON
+cannot close its script tag, and a Content-Security-Policy blocks all network
+loads and any script other than the page's own inline handler.
 """
 
+import base64
+import hashlib
 import html
 import json
+import math
+import os
 import time
 
 from delivery_doctor.doctor import STOP_POINTS
+from delivery_doctor.safety import atomic_write
 
 STAGE_COLORS = {
     "buffered": "#8a94a6", "attempt": "#3b82f6", "retry": "#f59e0b", "split": "#a855f7",
@@ -67,11 +77,45 @@ document.getElementById('lost-only').addEventListener('change', function (e) {
 """
 
 
+CSP = ("default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; "
+       "form-action 'none'; base-uri 'none'; script-src 'sha256-"
+       + base64.b64encode(hashlib.sha256(JS.encode()).digest()).decode() + "'")
+
+
 def _esc(v):
     return html.escape(str(v), quote=True)
 
 
+def _num(v, default=0.0):
+    """A finite float, or default. Untrusted report fields go through this."""
+    if isinstance(v, bool):
+        return default
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
+def _int(v):
+    return int(_num(v))
+
+
+def _list(v):
+    return v if isinstance(v, list) else []
+
+
+def _dicts(v):
+    return [e for e in _list(v) if isinstance(e, dict)]
+
+
+def _evidence(finding):
+    ev = finding.get("evidence") if isinstance(finding.get("evidence"), dict) else {}
+    return _dicts(ev.get("ledger")), _dicts(ev.get("intake"))
+
+
 def _fmt_bytes(n):
+    n = _num(n)
     if not n:
         return "0 B"
     for unit in ("B", "KB", "MB"):
@@ -82,9 +126,10 @@ def _fmt_bytes(n):
 
 def _times(report):
     ts = []
-    for f in report["events"]:
-        ts += [e["t"] for e in f["evidence"]["ledger"] if "t" in e]
-        ts += [e["received_at"] for e in f["evidence"]["intake"] if "received_at" in e]
+    for f in _dicts(report.get("events")):
+        ledger, intake = _evidence(f)
+        ts += [_num(e["t"]) for e in ledger if "t" in e]
+        ts += [_num(e["received_at"]) for e in intake if "received_at" in e]
     return (min(ts), max(ts)) if ts else (0.0, 1.0)
 
 
@@ -93,41 +138,50 @@ def _timeline(finding, t0, span):
         return 2 + 96 * (t - t0) / span
 
     dots = []
-    for e in finding["evidence"]["ledger"]:
+    ledger, intake = _evidence(finding)
+    for e in ledger:
         if "t" not in e:
             continue
+        t = _num(e["t"])
         extra = ", ".join(f"{k}={v}" for k, v in e.items() if k not in ("event_id", "stage", "t"))
-        tip = f"SDK {e['stage']} at +{(e['t'] - t0) * 1000:.0f}ms" + (f" ({extra})" if extra else "")
-        color = STAGE_COLORS.get(e["stage"], "#8a94a6")
-        dots.append(f'<span class="dot" style="left:{pos(e["t"]):.2f}%;background:{color}" '
+        tip = f"SDK {e.get('stage')} at +{(t - t0) * 1000:.0f}ms" + (f" ({extra})" if extra else "")
+        color = STAGE_COLORS.get(e.get("stage"), "#8a94a6")
+        dots.append(f'<span class="dot" style="left:{pos(t):.2f}%;background:{color}" '
                     f'title="{_esc(tip)}"></span>')
-    for e in finding["evidence"]["intake"]:
+    for e in intake:
         if "received_at" not in e:
             continue
-        key = "intake" if e["status"] == "accepted" else "intake-rejected"
-        tip = f"intake {e['status']} at +{(e['received_at'] - t0) * 1000:.0f}ms"
+        t = _num(e["received_at"])
+        key = "intake" if e.get("status") == "accepted" else "intake-rejected"
+        tip = f"intake {e.get('status')} at +{(t - t0) * 1000:.0f}ms"
         if e.get("reason"):
             tip += f" ({e['reason']})"
-        dots.append(f'<span class="dot end" style="left:{pos(e["received_at"]):.2f}%;'
+        dots.append(f'<span class="dot end" style="left:{pos(t):.2f}%;'
                     f'background:{STAGE_COLORS[key]}" title="{_esc(tip)}"></span>')
     return '<div class="track">' + "".join(dots) + "</div>"
 
 
 def render_html(report):
-    ok = report["ok"]
+    ok = report.get("ok") is True
     t0, t1 = _times(report)
     span = max(t1 - t0, 1e-3)
-    counts = report["counts"]
-    top = max(counts.values(), default=1)
-    created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(report.get("created_at", time.time())))
+    counts = report.get("counts") if isinstance(report.get("counts"), dict) else {}
+    counts = {str(k): max(_int(v), 0) for k, v in counts.items()}
+    top = max(counts.values(), default=1) or 1
+    try:
+        created = time.strftime("%Y-%m-%d %H:%M:%S",
+                                time.localtime(_num(report.get("created_at"), time.time())))
+    except (OverflowError, OSError, ValueError):
+        created = "unknown time"
+    event_bytes = report.get("event_bytes") if isinstance(report.get("event_bytes"), dict) else {}
 
     cards = [
-        (report["total"], "events tracked"),
-        (report["landed"], "landed"),
-        (report["total"] - report["landed"], "lost or pending"),
-        (report.get("attempts", 0), "send attempts"),
-        (_fmt_bytes(report.get("event_bytes", {}).get("total", 0)), "event payload"),
-        (f"{report.get('duration_s', span):.1f}s", "run time"),
+        (_int(report.get("total")), "events tracked"),
+        (_int(report.get("landed")), "landed"),
+        (_int(report.get("total")) - _int(report.get("landed")), "lost or pending"),
+        (_int(report.get("attempts")), "send attempts"),
+        (_fmt_bytes(event_bytes.get("total")), "event payload"),
+        (f"{_num(report.get('duration_s'), span):.1f}s", "run time"),
     ]
     card_html = "".join(f'<div class="card"><b>{_esc(v)}</b><span>{_esc(k)}</span></div>'
                         for v, k in cards)
@@ -143,18 +197,18 @@ def render_html(report):
             f'<div class="mono">{n}</div></div>')
 
     rows = []
-    for f in report["events"]:
-        stop = f["stop_point"]
+    for f in _dicts(report.get("events")):
+        stop = str(f.get("stop_point", "unknown"))
         cls = "ok" if stop == "landed" else ("wait" if stop == "in_flight" else "bad")
-        evidence = json.dumps(f["evidence"], indent=2)
+        evidence = json.dumps(f.get("evidence"), indent=2, default=str)
         rows.append(
             f'<tr class="{"landed" if stop == "landed" else "lost"}">'
-            f'<td class="mono">{_esc(f["event_id"])}</td>'
+            f'<td class="mono">{_esc(f.get("event_id", ""))}</td>'
             f'<td><span class="badge {cls}">{_esc(stop)}</span>'
-            f'<div class="hint">{_esc(f["detail"])}</div>'
+            f'<div class="hint">{_esc(f.get("detail", ""))}</div>'
             f'<details><summary>evidence</summary><pre>{_esc(evidence)}</pre></details></td>'
             f'<td class="mono">{_esc(_fmt_bytes(f.get("bytes")))}</td>'
-            f'<td class="mono">{f.get("attempts", 0)}</td>'
+            f'<td class="mono">{_int(f.get("attempts"))}</td>'
             f'<td>{_timeline(f, t0, span)}</td></tr>')
 
     legend = "".join(f'<span><i style="background:{c}"></i>{_esc(k)}</span>'
@@ -162,17 +216,27 @@ def render_html(report):
     fail = report.get("fail_mode")
     subtitle = (f"injected failure: {_esc(fail)} ({_esc(report.get('fail_description') or '')})"
                 if fail else "no failure injected")
-    data = json.dumps(report).replace("</", "<\\/")
+    # \u003c etc. keep the payload from ever closing the script tag or opening a comment
+    # The page is meant to be shared, so local filesystem paths (home dir, user
+    # name) are reduced to file names in the embedded copy.
+    shared = dict(report)
+    if isinstance(shared.get("artifacts"), dict):
+        shared["artifacts"] = {k: os.path.basename(str(v)) for k, v in shared["artifacts"].items()}
+    data = (json.dumps(shared, default=str).replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("&", "\\u0026").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+    run_id = _esc(report.get("run_id", "unknown"))
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="{CSP}">
+<meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Delivery Doctor report {_esc(report['run_id'])}</title>
+<title>Delivery Doctor report {run_id}</title>
 <style>{CSS}</style></head>
 <body><main>
-<h1>Delivery Doctor report <span class="mono muted">{_esc(report['run_id'])}</span></h1>
+<h1>Delivery Doctor report <span class="mono muted">{run_id}</span></h1>
 <div class="muted">{created} | {subtitle} | endpoint <span class="mono">{_esc(report.get('endpoint', ''))}</span></div>
-<div class="verdict {'ok' if ok else 'bad'}">{_esc(report['verdict'])}</div>
+<div class="verdict {'ok' if ok else 'bad'}">{_esc(report.get('verdict', 'no verdict'))}</div>
 <div class="cards">{card_html}</div>
 <h2>Where events stopped</h2>
 <div class="hist">{''.join(hist)}</div>
@@ -192,6 +256,5 @@ def render_html(report):
 
 
 def write_html(report, path):
-    with open(path, "w") as f:
-        f.write(render_html(report))
-    return path
+    """Render and write atomically. Returns the absolute path written."""
+    return atomic_write(path, render_html(report))

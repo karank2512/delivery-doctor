@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Stdlib only: no pip install needed for the suite or the quickstart.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: unit and end-to-end tests (stdlib unittest)
+        run: python -m unittest discover -s tests -t . -v
+      - name: quickstart exit codes
+        shell: bash
+        run: |
+          expect() { want=$1; shift; rc=0; "$@" || rc=$?
+                     echo "exit $rc (want $want): $*"; test "$rc" -eq "$want"; }
+          expect 0 python -m delivery_doctor check
+          expect 1 python -m delivery_doctor check --fail buffer
+          expect 2 python -m delivery_doctor check --n 0
+          expect 1 python -m delivery_doctor report --html report.html
+          test -s report.html
+
+  pytest:
+    # Optional: the same suite under pytest. pytest is a dev-only dependency
+    # installed here in CI; the project itself has no runtime dependencies.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install pytest
+      - run: python -m pytest -q
