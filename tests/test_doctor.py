@@ -249,12 +249,14 @@ class DoctorTests(TempCase):
         with IntakeServer(str(tmp_path / "log.jsonl")) as srv:
             proc = subprocess.Popen([sys.executable, "-m", "mock_raindrop.sample_agent",
                                      "--endpoint", srv.url, "--api-key", DEFAULT_API_KEY,
-                                     "--run-id", "ext", "--duration", "0.6", "--rate", "20",
+                                     "--run-id", "ext", "--n", "12",
                                      "--ledger", str(ledger)])
-            proc.wait(timeout=30)
+            # Attach correctness must not depend on scheduler throughput in 0.6s.
+            # The external emitter exits before watch starts; use an exact count.
+            assert proc.wait(timeout=30) == 0
             report = watch(ledger=str(ledger), intake=srv.url, duration=0.5, interval=0.2,
                            out=io.StringIO(), workdir=str(tmp_path / "w"))
-        assert report["ok"] and report["total"] > 5
+        assert report["ok"] and report["total"] == 12
 
 
     def test_html_report_is_self_contained(self):
