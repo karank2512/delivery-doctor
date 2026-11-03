@@ -13,7 +13,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Python 3.9 has builds for Ubuntu24.04, not Ubuntu26.04.
+        os: [ubuntu-24.04, macos-latest]
         python: ["3.9", "3.11", "3.13"]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
