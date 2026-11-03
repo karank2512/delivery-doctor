@@ -24,9 +24,11 @@ MAX_RESPONSE_BYTES = 32 * 1024 * 1024  # intake read-back body
 MAX_REPORT_BYTES = 64 * 1024 * 1024  # report.json accepted by `report --from`
 RUN_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 REDACTED = "[redacted]"
-# Field names whose values are masked. Anchored so e.g. "prompt_tokens" is left alone.
-SECRET_KEY_RE = re.compile(r"(api[_-]?key|access[_-]?key|private[_-]?key|secret|passw(or)?d|"
-                           r"authorization|cookie|(^|[_-])(auth|token|session)$)", re.I)
+# Field names whose values are masked. Names are first split into words
+# (camelCase and kebab-case become snake_case), then matched word by word, so
+# authToken / access-token / session_id are caught while prompt_tokens is not.
+SECRET_KEY_RE = re.compile(r"(api_?key|access_?key|private_?key|secret|passw(or)?d|authorization|"
+                           r"cookie|credentials?|(^|_)(auth|token|session|jwt)(_|$))")
 MIN_SECRET_LEN = 8  # shorter "secrets" would rewrite ordinary text, so they are not substring-masked
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
@@ -129,7 +131,8 @@ def get_json(url, headers, timeout, limit=MAX_RESPONSE_BYTES, secrets=()):
     within 2 * timeout. Error text is redacted with secrets before it is raised.
     """
     def fail(msg):
-        return DoctorError(redact(f"intake read-back failed: {msg}", secrets))
+        text = safe_text(f"intake read-back failed: {msg}", 1000)
+        return DoctorError(redact(text, secrets, min_len=1))
 
     req = urllib.request.Request(url, headers=headers)
     deadline = time.monotonic() + 2 * timeout
@@ -159,16 +162,27 @@ def safe_text(value, limit=None):
     return text
 
 
-def redact(value, secrets=(), _depth=0):
-    """Copy of value with secret-named keys masked and known secret strings replaced."""
-    secrets = tuple(s for s in secrets if isinstance(s, str) and len(s) >= MIN_SECRET_LEN)
+def is_secret_key(name):
+    if not isinstance(name, str):
+        return False
+    words = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name).replace("-", "_").lower()
+    return bool(SECRET_KEY_RE.search(words))
+
+
+def redact(value, secrets=(), _depth=0, min_len=MIN_SECRET_LEN):
+    """Copy of value with secret-named keys masked and known secret strings replaced.
+
+    In bulk data, secrets shorter than min_len are not substring-masked (a
+    1-char "key" would rewrite everything). Error messages pass min_len=1.
+    """
+    secrets = tuple(s for s in secrets if isinstance(s, str) and len(s) >= max(min_len, 1))
     if _depth > 50:
         return REDACTED
     if isinstance(value, dict):
-        return {k: (REDACTED if isinstance(k, str) and SECRET_KEY_RE.search(k)
-                    else redact(v, secrets, _depth + 1)) for k, v in value.items()}
+        return {k: (REDACTED if is_secret_key(k)
+                    else redact(v, secrets, _depth + 1, min_len)) for k, v in value.items()}
     if isinstance(value, list):
-        return [redact(v, secrets, _depth + 1) for v in value]
+        return [redact(v, secrets, _depth + 1, min_len) for v in value]
     if isinstance(value, str):
         for s in secrets:
             value = value.replace(s, REDACTED)

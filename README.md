@@ -179,7 +179,7 @@ Each run writes to `.doctor_runs/<run_id>/` in the repo, or to `$DELIVERY_DOCTOR
 | `report.json` | the verdict plus per-event evidence; payloads over 2 KB are replaced by their size |
 | `emitter_stderr.txt` | watch mode only: the emitter's stderr |
 
-Run directories are created owner-only (`0700`) and `report.json` is `0600`. Before `report.json` or an HTML report is written, values under secret-looking keys are replaced with `[redacted]`. That covers `api_key`, `access_key`, `private_key`, `secret`, `password`, `authorization`, and `cookie`, plus keys named, or ending in, `auth`, `token`, or `session`; `prompt_tokens`-style counters are left alone. The configured read key and the mock's test keys are replaced wherever they appear, including emitter stderr, and redaction runs before any truncation. Credentials are stripped from the endpoint URL. A read key shorter than 8 characters is not substring-masked, because masking would rewrite ordinary text. The same redaction is applied to reports rendered with `report --from`. The HTML report reduces local file paths to file names, because it is meant to be shared. It carries a Content-Security-Policy that blocks all network loads and allows only its own inline script, pinned by hash. Every value from the report is escaped, so a crafted `report.json` passed to `--from` cannot inject markup.
+Run directories are created owner-only (`0700`) and `report.json` is `0600`. Before `report.json` or an HTML report is written, values under secret-looking keys are replaced with `[redacted]`. Key names are split into words first, so `authToken`, `access-token`, and `session_id` all count. That covers `api_key`, `access_key`, `private_key`, `secret`, `password`, `authorization`, `cookie`, and `credentials`, plus any name with the word `auth`, `token`, `session`, or `jwt`; `prompt_tokens`-style counters are left alone. The configured read key and the mock's test keys are replaced wherever they appear, including emitter stderr, and redaction runs before any truncation. Credentials are stripped from the endpoint URL. A read key shorter than 8 characters is masked in error messages but not inside report data, where masking it would rewrite ordinary text. The same redaction is applied to reports rendered with `report --from`. Error messages also have control characters removed before they are printed. The HTML report reduces local file paths to file names, because it is meant to be shared. It carries a Content-Security-Policy that blocks all network loads and allows only its own inline script, pinned by hash. Every value from the report is escaped, so a crafted `report.json` passed to `--from` cannot inject markup.
 
 Nothing is deleted automatically. `rm -rf .doctor_runs` clears every run. The raw `intake_log.jsonl` is not redacted. It is the mock server's own log and holds whatever the canaries carried.
 
@@ -207,7 +207,7 @@ The suite uses only the standard library:
 python3 -m unittest discover -s tests -t .
 ```
 
-It runs 82 tests in about 50 seconds. Every server in it is a local fake on `127.0.0.1`, and nothing in it touches the network beyond loopback. If you already have pytest, `python3 -m pytest -q` runs the same tests.
+It runs 85 tests in about 50 seconds. Every server in it is a local fake on `127.0.0.1`, and nothing in it touches the network beyond loopback. If you already have pytest, `python3 -m pytest -q` runs the same tests.
 
 ## Readiness
 

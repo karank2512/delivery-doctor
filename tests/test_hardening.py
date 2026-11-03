@@ -716,6 +716,33 @@ class ReviewRegressionTests(TempCase):
         for k in ("access_token", "private_key", "auth", "session"):
             self.assertEqual(out[k], "[redacted]")
 
+    def test_camel_case_and_word_split_secret_keys(self):
+        for k in ("authToken", "accessToken", "idToken", "sessionToken", "session_id",
+                  "auth_header", "credentials", "jwt", "X-Api-Key", "client-secret"):
+            self.assertTrue(safety.is_secret_key(k), k)
+        for k in ("prompt_tokens", "completion_tokens", "author", "tokenizer", "event_id"):
+            self.assertFalse(safety.is_secret_key(k), k)
+
+    def test_short_read_key_and_control_chars_masked_in_errors(self):
+        class Echo(Quiet):
+            def do_GET(self):
+                self._send(401, json.dumps({"error": "bad key " + self.headers["X-Api-Key"]
+                                            + " \x1b[2J"}).encode())
+        line = json.dumps({"event_id": "e1", "stage": "buffered", "t": 1})
+        with mock.patch.dict(os.environ, {"DELIVERY_DOCTOR_API_KEY": "abc1234"}):
+            code, _, err = self.attach([line], Echo)
+        self.assertEqual(code, 3)
+        self.assertNotIn("abc1234", err)
+        self.assertNotIn("\x1b", err)
+
+    def test_internal_error_text_is_redacted(self):
+        boom = RuntimeError(f"exploded near {DEFAULT_API_KEY}\x1b[2J")
+        with mock.patch.object(doctor, "emitter_cmd", side_effect=boom):
+            code, _, err = self.run_cli(["check", "--n", "2"])
+        self.assertEqual(code, 3)
+        self.assertNotIn(DEFAULT_API_KEY, err)
+        self.assertNotIn("\x1b", err)
+
     def test_watch_volume_cap_is_a_usage_error(self):
         self.assertEqual(self.run_cli(["watch", "--rate", "1000", "--duration", "3600"])[0], 2)
 

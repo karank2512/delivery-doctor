@@ -13,11 +13,11 @@ import json
 import os
 import sys
 
-from delivery_doctor.doctor import (FAILURES, FAIL_MODES, MAX_EVENTS, MIN_EVENTS, latest_report,
-                                    render_table, run_check, runs_dir)
+from delivery_doctor.doctor import (FAILURES, FAIL_MODES, MAX_EVENTS, MIN_EVENTS, MOCK_KEYS,
+                                    latest_report, render_table, run_check, runs_dir)
 from delivery_doctor.html_report import write_html
 from delivery_doctor.safety import (MAX_REPORT_BYTES, RUN_ID_RE, DoctorError, check_output_path,
-                                    safe_text, validate_intake_url)
+                                    redact, safe_text, validate_intake_url)
 from delivery_doctor.watch import BOUNDS, check_volume
 
 EXIT_OK, EXIT_LOST, EXIT_USAGE, EXIT_ERROR, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
@@ -230,21 +230,24 @@ def _run(args, ap):
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
+    secrets = MOCK_KEYS + tuple(k for k in (getattr(args, "api_key", None),
+                                            os.environ.get(API_KEY_ENV)) if k)
+
+    def report_error(text, code):
+        print("error: " + redact(safe_text(text, 1000), secrets, min_len=1), file=sys.stderr)
+        return code
+
     try:
         return _run(args, ap)
     except UsageError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return EXIT_USAGE
+        return report_error(str(e), EXIT_USAGE)
     except DoctorError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return EXIT_ERROR
+        return report_error(str(e), EXIT_ERROR)
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return EXIT_INTERRUPTED
     except Exception as e:  # never let a crash masquerade as exit 1 ("events lost")
-        print(f"error: internal error, no verdict: {type(e).__name__}: {safe_text(e, 500)}",
-              file=sys.stderr)
-        return EXIT_ERROR
+        return report_error(f"internal error, no verdict: {type(e).__name__}: {e}", EXIT_ERROR)
 
 
 if __name__ == "__main__":
