@@ -18,7 +18,7 @@ from delivery_doctor.doctor import (FAILURES, FAIL_MODES, MAX_EVENTS, MIN_EVENTS
 from delivery_doctor.html_report import write_html
 from delivery_doctor.safety import (MAX_REPORT_BYTES, RUN_ID_RE, DoctorError, check_output_path,
                                     safe_text, validate_intake_url)
-from delivery_doctor.watch import BOUNDS
+from delivery_doctor.watch import BOUNDS, check_volume
 
 EXIT_OK, EXIT_LOST, EXIT_USAGE, EXIT_ERROR, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
 API_KEY_ENV = "DELIVERY_DOCTOR_API_KEY"
@@ -88,8 +88,10 @@ def load_report(source):
             try:
                 with open(path, encoding="utf-8") as f:
                     report = json.load(f)
-            except (ValueError, UnicodeDecodeError) as e:
-                raise UsageError(f"{path} is not valid JSON: {e}")
+            except OSError as e:
+                raise UsageError(f"cannot read {path}: {e.strerror or e}")
+            except (ValueError, UnicodeDecodeError, RecursionError) as e:
+                raise UsageError(f"{path} is not usable JSON: {type(e).__name__}")
             missing = [k for k in ("run_id", "ok", "verdict", "events")
                        if not isinstance(report, dict) or k not in report]
             if missing or not isinstance(report["events"], list):
@@ -175,6 +177,11 @@ def _run(args, ap):
             ap.error("attach mode needs both --ledger and --intake")
         if args.ledger and (args.fail or args.gzip):
             ap.error("--fail and --gzip apply to managed mode only, not --ledger/--intake")
+        if not args.ledger:
+            try:
+                check_volume(args.rate, args.duration)
+            except DoctorError as e:
+                ap.error(str(e))
         if args.allow_remote_intake and not args.intake:
             ap.error("--allow-remote-intake only applies with --ledger/--intake")
         if args.intake:
@@ -198,6 +205,8 @@ def _run(args, ap):
             if args.html:
                 print(f"HTML report: {rel(result['artifacts']['html'])}")
             print(result["verdict"])
+        if result.get("interrupted"):
+            return EXIT_INTERRUPTED
 
     else:  # report
         fresh = args.fail or args.gzip
@@ -232,6 +241,10 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return EXIT_INTERRUPTED
+    except Exception as e:  # never let a crash masquerade as exit 1 ("events lost")
+        print(f"error: internal error, no verdict: {type(e).__name__}: {safe_text(e, 500)}",
+              file=sys.stderr)
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":

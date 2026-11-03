@@ -86,14 +86,16 @@ python3 -m delivery_doctor report --html report.html
     in_flight            ## 2
 ```
 
-By default it starts its own intake and a streaming sample agent (`--duration` 0.1 to 3600 s, `--rate` 0.1 to 1000 events/s, `--interval` 0.1 to 60 s). To watch an emitter you started yourself, point it at that emitter's ledger and intake: `watch --ledger sdk_ledger.jsonl --intake http://127.0.0.1:8787`. With `--json` it prints one JSON object per tick and a final report line. Events that are still buffered or being retried count as in flight while the emitter runs, not as lost. If watching stops while some are still in flight, the verdict says so and the run does not pass.
+By default it starts its own intake and a streaming sample agent (`--duration` 0.1 to 3600 s, `--rate` 0.1 to 1000 events/s, `--interval` 0.1 to 60 s, and `rate x duration` at most 100,000 events). To watch an emitter you started yourself, point it at that emitter's ledger and intake: `watch --ledger sdk_ledger.jsonl --intake http://127.0.0.1:8787`. With `--json` it prints one JSON object per tick and a final report line. Events that are still buffered or being retried count as in flight while the emitter runs, not as lost. If watching stops while some are still in flight, the verdict says so and the run does not pass.
 
 Attach mode reads from an intake you name, so it is locked down by default:
 
 - The intake must be `http://` or `https://` on a loopback host (`127.0.0.1`, `::1`, `localhost`). Other schemes, credentials in the URL, and query strings are refused with exit code 2.
 - A non-loopback intake needs `--allow-remote-intake` and must use `https`, so the read key never crosses a network in clear. This path is only unit-tested against URL validation. It has not been run against any real service.
 - Pass the read key through `DELIVERY_DOCTOR_API_KEY` rather than `--api-key`, because command-line flags show up in the process list.
-- Read-back requests never follow redirects (urllib would otherwise forward the key header to the redirect target), skip `HTTP(S)_PROXY` for loopback hosts, time out after 5 s, and refuse bodies over 32 MB. A ledger line that is not a well-formed entry is skipped and counted in `ledger_lines_skipped`.
+- Read-back requests never follow redirects (urllib would otherwise forward the key header to the redirect target) and skip `HTTP(S)_PROXY` for loopback hosts. Each socket read times out after 5 s, and a request that runs past 10 s overall is abandoned at the next read, so the worst case is about 15 s. Bodies over 32 MB are refused, and the key is masked in any error text.
+- A foreign ledger is parsed defensively. Lines that are not well-formed entries are skipped and counted in `ledger_lines_skipped`, and numeric fields with the wrong type are dropped. Garbage from the ledger or the intake produces exit 2 or 3, never a traceback that could be mistaken for exit 1.
+- Ctrl-C ends `watch` with exit 130 and an `INTERRUPTED (partial, not a verdict)` report. An interrupt never passes.
 
 **`report --html out.html`**: a single HTML file you can attach to a ticket. It has the verdict, summary stats, a stop-point histogram with fix hints, and a timeline row per event showing each hop (buffered, attempt, retry, split, acked, intake receipt) at its real time offset. Every row expands to its raw evidence. All CSS and JS is inline and the full report JSON is embedded, so the file works offline. It reads the latest run by default; `--from` takes a run id, a run directory, or a `report.json` path, and `--fail MODE` runs a new check first.
 
@@ -108,7 +110,7 @@ Attach mode reads from an intake you name, so it is locked down by default:
 | `0` | every event landed and was read back |
 | `1` | at least one event was lost, or nothing was tracked, so nothing was verified |
 | `2` | usage error: unknown flag, out-of-range value, unusable path or report file, refused intake URL |
-| `3` | the doctor could not finish: intake could not be read back, or the emitter crashed or hung. No delivery verdict is given. |
+| `3` | the doctor could not finish: intake could not be read back, the emitter crashed or hung, or an internal error occurred. No delivery verdict is given. |
 | `130` | interrupted |
 
 Exit code 3 exists so that a broken harness is never reported as lost events, or as a pass.
@@ -177,7 +179,7 @@ Each run writes to `.doctor_runs/<run_id>/` in the repo, or to `$DELIVERY_DOCTOR
 | `report.json` | the verdict plus per-event evidence; payloads over 2 KB are replaced by their size |
 | `emitter_stderr.txt` | watch mode only: the emitter's stderr |
 
-Run directories are created owner-only (`0700`) and `report.json` is `0600`. Before `report.json` or an HTML report is written, values under secret-looking keys (`api_key`, `authorization`, `token`, `secret`, `password`, `cookie`) are replaced with `[redacted]`, as are the configured read key and the mock's test keys, and credentials are stripped from the endpoint URL. The HTML report reduces local file paths to file names, because it is meant to be shared. It carries a Content-Security-Policy that blocks all network loads and allows only its own inline script, pinned by hash. Every value from the report is escaped, so a crafted `report.json` passed to `--from` cannot inject markup.
+Run directories are created owner-only (`0700`) and `report.json` is `0600`. Before `report.json` or an HTML report is written, values under secret-looking keys are replaced with `[redacted]`. That covers `api_key`, `access_key`, `private_key`, `secret`, `password`, `authorization`, and `cookie`, plus keys named, or ending in, `auth`, `token`, or `session`; `prompt_tokens`-style counters are left alone. The configured read key and the mock's test keys are replaced wherever they appear, including emitter stderr, and redaction runs before any truncation. Credentials are stripped from the endpoint URL. A read key shorter than 8 characters is not substring-masked, because masking would rewrite ordinary text. The same redaction is applied to reports rendered with `report --from`. The HTML report reduces local file paths to file names, because it is meant to be shared. It carries a Content-Security-Policy that blocks all network loads and allows only its own inline script, pinned by hash. Every value from the report is escaped, so a crafted `report.json` passed to `--from` cannot inject markup.
 
 Nothing is deleted automatically. `rm -rf .doctor_runs` clears every run. The raw `intake_log.jsonl` is not redacted. It is the mock server's own log and holds whatever the canaries carried.
 
@@ -205,7 +207,7 @@ The suite uses only the standard library:
 python3 -m unittest discover -s tests -t .
 ```
 
-It runs 70 tests in about 40 seconds. Every server in it is a local fake on `127.0.0.1`, and nothing in it touches the network beyond loopback. If you already have pytest, `python3 -m pytest -q` runs the same tests.
+It runs 82 tests in about 50 seconds. Every server in it is a local fake on `127.0.0.1`, and nothing in it touches the network beyond loopback. If you already have pytest, `python3 -m pytest -q` runs the same tests.
 
 ## Readiness
 
@@ -221,6 +223,7 @@ What has been verified, and how:
 | Redaction and file permissions | Verified locally | `ArtifactPrivacyTests` |
 | HTML escaping and CSP | Verified locally | `HtmlSafetyTests`; CSP hash enforcement checked once by hand in headless Chrome |
 | Emitter cleanup on errors and interrupts | Verified locally | `FailureSurfacingTests` |
+| Hostile intake and ledger input gives exit 2 or 3, never a traceback | Verified locally | `ReviewRegressionTests` (from an independent review of this pass) |
 | Python 3.9, 3.11, 3.13 on macOS | Verified locally | full suite on each interpreter |
 | CI on Linux and macOS | Configured, not yet run | `.github/workflows/ci.yml`; it has not run on GitHub yet |
 | Windows | Not tested | |

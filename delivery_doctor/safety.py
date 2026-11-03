@@ -9,11 +9,13 @@
 - artifacts: written atomically, run directories created owner-only
 """
 
+import http.client
 import ipaddress
 import json
 import os
 import re
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,8 +24,10 @@ MAX_RESPONSE_BYTES = 32 * 1024 * 1024  # intake read-back body
 MAX_REPORT_BYTES = 64 * 1024 * 1024  # report.json accepted by `report --from`
 RUN_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 REDACTED = "[redacted]"
-SECRET_KEY_RE = re.compile(r"(api[_-]?key|authorization|token|secret|password|passwd|cookie)",
-                           re.I)
+# Field names whose values are masked. Anchored so e.g. "prompt_tokens" is left alone.
+SECRET_KEY_RE = re.compile(r"(api[_-]?key|access[_-]?key|private[_-]?key|secret|passw(or)?d|"
+                           r"authorization|cookie|(^|[_-])(auth|token|session)$)", re.I)
+MIN_SECRET_LEN = 8  # shorter "secrets" would rewrite ordinary text, so they are not substring-masked
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
@@ -41,9 +45,11 @@ def is_loopback_host(host):
     if host.lower() == "localhost":
         return True
     try:
-        return ipaddress.ip_address(host.strip("[]")).is_loopback
+        ip = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
         return False
+    mapped = getattr(ip, "ipv4_mapped", None)  # same answer on every Python version
+    return (mapped or ip).is_loopback
 
 
 def validate_intake_url(url, allow_remote=False):
@@ -94,30 +100,55 @@ def build_opener(url):
     return urllib.request.build_opener(*handlers)
 
 
-def read_bounded(resp, limit=MAX_RESPONSE_BYTES):
-    data = resp.read(limit + 1)
-    if len(data) > limit:
-        raise DoctorError(f"intake response is larger than {limit} bytes")
-    return data
+def read_bounded(resp, limit=MAX_RESPONSE_BYTES, deadline=None):
+    """Read at most limit bytes, in chunks, giving up once deadline (monotonic) passes.
+
+    Each chunk read is still bounded by the socket timeout, so the worst case
+    is deadline plus one socket timeout.
+    """
+    chunks, size = [], 0
+    while True:
+        if deadline is not None and time.monotonic() > deadline:
+            raise DoctorError("intake response took too long to arrive")
+        # read1 returns what has arrived; read(n) would block until n bytes, so a
+        # server dripping one byte at a time could hold it far past the deadline
+        reader = getattr(resp, "read1", resp.read)
+        chunk = reader(min(65536, limit + 1 - size))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > limit:
+            raise DoctorError(f"intake response is larger than {limit} bytes")
 
 
-def get_json(url, headers, timeout, limit=MAX_RESPONSE_BYTES):
-    """GET a JSON document with the guards above. Raises DoctorError on any failure."""
+def get_json(url, headers, timeout, limit=MAX_RESPONSE_BYTES, secrets=()):
+    """GET a JSON document with the guards above. Raises DoctorError on any failure.
+
+    timeout is the per-read socket timeout; the whole request must also finish
+    within 2 * timeout. Error text is redacted with secrets before it is raised.
+    """
+    def fail(msg):
+        return DoctorError(redact(f"intake read-back failed: {msg}", secrets))
+
     req = urllib.request.Request(url, headers=headers)
+    deadline = time.monotonic() + 2 * timeout
     try:
         with build_opener(url).open(req, timeout=timeout) as resp:
-            body = read_bounded(resp, limit)
+            body = read_bounded(resp, limit, deadline)
     except urllib.error.HTTPError as e:
-        detail = e.read(500).decode("utf-8", "replace") if e.fp else ""
+        try:
+            detail = e.read(500).decode("utf-8", "replace") if e.fp else ""
+        except (OSError, http.client.HTTPException):
+            detail = ""
         hint = " (check --api-key)" if e.code in (401, 403) else ""
-        raise DoctorError(f"intake read-back failed: HTTP {e.code}{hint} {safe_text(detail)}".rstrip())
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        reason = getattr(e, "reason", e)
-        raise DoctorError(f"intake read-back failed: {reason}")
+        raise fail(f"HTTP {e.code}{hint} {safe_text(detail)}".rstrip())
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+        raise fail(getattr(e, "reason", None) or f"{type(e).__name__}: {e}")
     try:
         return json.loads(body)
-    except ValueError:
-        raise DoctorError("intake read-back returned something that is not JSON")
+    except (ValueError, RecursionError):
+        raise fail("response is not usable JSON")
 
 
 def safe_text(value, limit=None):
@@ -130,7 +161,7 @@ def safe_text(value, limit=None):
 
 def redact(value, secrets=(), _depth=0):
     """Copy of value with secret-named keys masked and known secret strings replaced."""
-    secrets = tuple(s for s in secrets if s)
+    secrets = tuple(s for s in secrets if isinstance(s, str) and len(s) >= MIN_SECRET_LEN)
     if _depth > 50:
         return REDACTED
     if isinstance(value, dict):

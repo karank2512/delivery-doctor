@@ -31,6 +31,7 @@ def runs_dir():
 
 
 WRONG_API_KEY = "rd_wrong_key"
+MOCK_KEYS = (DEFAULT_API_KEY, EXPIRED_API_KEY, WRONG_API_KEY)
 RUNS_DIR = runs_dir()  # value at import time; code paths call runs_dir()
 
 # Input bounds. Wide enough for real use, tight enough that a typo cannot hang
@@ -150,10 +151,27 @@ def read_ledger(path, stats=None):
                     or entry.get("stage") not in LEDGER_STAGES):
                 stats["skipped"] += 1
                 continue
+            _normalize_entry(entry)
             if entry["event_id"] not in by_id and len(by_id) >= MAX_LEDGER_IDS:
                 raise DoctorError(f"ledger {path} has more than {MAX_LEDGER_IDS} event ids")
             by_id.setdefault(entry["event_id"], []).append(entry)
     return by_id
+
+
+_NUMERIC_FIELDS = {"t": (int, float), "bytes": int, "attempt": int, "attempts": int,
+                   "status": int, "queue_size": int, "wait": (int, float)}
+
+
+def _normalize_entry(entry):
+    """Drop numeric fields with the wrong type, so a foreign ledger can't crash classification."""
+    for key, kind in _NUMERIC_FIELDS.items():
+        if key in entry and (isinstance(entry[key], bool) or not isinstance(entry[key], kind)):
+            del entry[key]
+    if "t" in entry and not (-1e12 < entry["t"] < 1e12):
+        del entry["t"]
+    for key in ("kind", "error", "body", "reason"):
+        if key in entry and not isinstance(entry[key], str):
+            entry[key] = str(entry[key])
 
 
 def query_intake(url, ids, api_key=DEFAULT_API_KEY, chunk=200, timeout=READ_TIMEOUT_S):
@@ -167,24 +185,27 @@ def query_intake(url, ids, api_key=DEFAULT_API_KEY, chunk=200, timeout=READ_TIME
     wanted = set(ids)
     for start in range(0, len(ids), chunk):
         query = urllib.parse.urlencode({"ids": ",".join(ids[start:start + chunk])}, safe=",")
-        doc = get_json(f"{url}/v1/events?{query}", {"X-Api-Key": api_key}, timeout)
+        doc = get_json(f"{url}/v1/events?{query}", {"X-Api-Key": api_key}, timeout,
+                       secrets=(api_key,))
         entries = doc.get("entries") if isinstance(doc, dict) else None
         if not isinstance(entries, list):
             raise DoctorError("intake read-back response has no 'entries' list")
         for entry in entries:
-            if (isinstance(entry, dict) and entry.get("event_id") in wanted
+            if (isinstance(entry, dict) and isinstance(entry.get("event_id"), str)
+                    and entry.get("event_id") in wanted
                     and entry.get("status") in ("accepted", "rejected")):
                 by_id.setdefault(entry["event_id"], []).append(entry)
     return by_id
 
 
 def _failure_stop(fail):
-    if fail["kind"] == "connection":
-        return "send_failed_network", f"{fail['error']} after {fail['attempts']} attempts"
-    if fail["kind"] == "timeout":
-        return "send_timeout", f"{fail['error']} after {fail['attempts']} attempts"
-    if fail["kind"] != "http" or not isinstance(fail.get("status"), int):
-        return "send_failed_http", f"{fail.get('error', 'unusable response')} after {fail.get('attempts')} attempts"
+    kind, attempts = fail.get("kind"), fail.get("attempts", "?")
+    if kind == "connection":
+        return "send_failed_network", f"{fail.get('error', 'connection error')} after {attempts} attempts"
+    if kind == "timeout":
+        return "send_timeout", f"{fail.get('error', 'timed out')} after {attempts} attempts"
+    if kind != "http" or not isinstance(fail.get("status"), int):
+        return "send_failed_http", f"{fail.get('error', 'unusable response')} after {attempts} attempts"
     status, body = fail["status"], fail.get("body", "")
     body = safe_text(body, limit=500)
     try:
@@ -199,8 +220,8 @@ def _failure_stop(fail):
     if status == 413:
         return "payload_too_large", f"HTTP 413 {body}"
     if status == 429:
-        return "rate_limited", f"HTTP 429 after {fail['attempts']} attempts"
-    return "send_failed_http", f"HTTP {status} after {fail['attempts']} attempts"
+        return "rate_limited", f"HTTP 429 after {attempts} attempts"
+    return "send_failed_http", f"HTTP {status} after {attempts} attempts"
 
 
 def classify(event_id, ledger, server, live=False):
@@ -334,7 +355,7 @@ def sanitize_report(report, secrets=()):
     The mock's well-known test keys are masked too, so artifacts never carry
     any key, real or fake.
     """
-    secrets = tuple(secrets) + (DEFAULT_API_KEY, EXPIRED_API_KEY, WRONG_API_KEY)
+    secrets = tuple(secrets) + MOCK_KEYS
     clean = redact(report, secrets)
     if isinstance(clean.get("endpoint"), str):
         clean["endpoint"] = redact_url(clean["endpoint"])
@@ -363,7 +384,8 @@ def run_check(n=12, fail=None, workdir=None, timeout=2.0, gzip=False,
 
     Raises DoctorError when the check itself cannot produce a trustworthy
     verdict: bad input, the emitter hung or crashed, or intake could not be
-    read back. A report with "error" set is still written when possible.
+    read back. No report.json is written in that case; the ledger and intake
+    log stay in the run directory for inspection.
     """
     if fail not in (None,) + FAIL_MODES:
         raise ValueError(f"unknown fail mode {fail!r}")
@@ -387,7 +409,7 @@ def run_check(n=12, fail=None, workdir=None, timeout=2.0, gzip=False,
         ledger_stats = {}
         ledger = read_ledger(ledger_path, ledger_stats)
         if proc.returncode != 0:
-            tail = safe_text(redact(proc.stderr[-1000:], (DEFAULT_API_KEY,)))
+            tail = safe_text(redact(proc.stderr, MOCK_KEYS)[-1000:])
             raise DoctorError(f"canary emitter exited with code {proc.returncode}, so the run "
                               f"proves nothing about delivery. stderr tail: {tail}")
 
@@ -403,7 +425,7 @@ def run_check(n=12, fail=None, workdir=None, timeout=2.0, gzip=False,
     report = build_report(run_id, fail, endpoint, ids, findings, workdir,
                           gzip=gzip, started_at=started, duration_s=round(time.time() - started, 3),
                           emitter_exit_code=proc.returncode,
-                          emitter_stderr=safe_text(proc.stderr[-2000:]),
+                          emitter_stderr=safe_text(redact(proc.stderr, MOCK_KEYS)[-2000:]),
                           ledger_lines_skipped=ledger_stats["skipped"])
     write_report(report, workdir)
     return report

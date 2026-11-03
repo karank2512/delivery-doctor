@@ -18,10 +18,11 @@ import time
 import uuid
 from collections import Counter
 
-from delivery_doctor.doctor import (REPO_ROOT, build_report, classify, emitter_cmd, free_port,
-                                    query_intake, read_ledger, runs_dir, server_knobs,
-                                    write_report, FAIL_MODES)
-from delivery_doctor.safety import DoctorError, private_makedirs, safe_text, validate_intake_url
+from delivery_doctor.doctor import (MAX_LEDGER_IDS, MOCK_KEYS, REPO_ROOT, build_report, classify,
+                                    emitter_cmd, free_port, query_intake, read_ledger, runs_dir,
+                                    server_knobs, write_report, FAIL_MODES)
+from delivery_doctor.safety import (DoctorError, private_makedirs, redact, safe_text,
+                                    validate_intake_url)
 from mock_raindrop.server import DEFAULT_API_KEY, IntakeServer
 
 # name -> (min, max); all in seconds or events per second
@@ -34,6 +35,15 @@ def check_bounds(**values):
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(value) or not lo <= value <= hi):
             raise DoctorError(f"--{name} must be between {lo:g} and {hi:g}, got {value!r}")
+    if "rate" in values and "duration" in values:
+        check_volume(values["rate"], values["duration"])
+
+
+def check_volume(rate, duration):
+    """A managed run must stay under the ledger id cap, or it is bound to end in an error."""
+    if rate * duration > MAX_LEDGER_IDS:
+        raise DoctorError(f"--rate x --duration would emit about {rate * duration:.0f} events; "
+                          f"the limit is {MAX_LEDGER_IDS}")
 
 
 def stop_emitter(proc, grace=3.0):
@@ -143,15 +153,16 @@ def watch(fail=None, duration=10.0, rate=20.0, interval=1.0, gzip=False,
     if ledger:  # attach mode: someone else runs the emitter and the intake
         if not intake:
             raise ValueError("attach mode needs --intake as well as --ledger")
+        interrupted = False
         try:
             loop(ledger, intake, lambda: time.time() - start < duration)
         except KeyboardInterrupt:
-            pass
+            interrupted = True
         if not os.path.isfile(ledger):
             raise DoctorError(f"ledger {ledger} never appeared; is the emitter writing to it?")
         ids, findings = snapshot(ledger, intake, api_key, live=True, stats=stats)
         endpoint = intake
-        emitter = {}
+        emitter = {"interrupted": interrupted}
     else:
         ledger = os.path.join(workdir, "sdk_ledger.jsonl")
         stderr_path = os.path.join(workdir, "emitter_stderr.txt")
@@ -173,7 +184,7 @@ def watch(fail=None, duration=10.0, rate=20.0, interval=1.0, gzip=False,
             if proc.returncode != 0 and not interrupted:
                 stderr_file.flush()
                 with open(stderr_path, errors="replace") as f:
-                    tail = safe_text(f.read()[-1000:])
+                    tail = safe_text(redact(f.read(), MOCK_KEYS + (api_key,))[-1000:])
                 raise DoctorError(f"emitter exited with code {proc.returncode}, so the run proves "
                                   f"nothing about delivery. stderr tail: {tail}")
             ids, findings = snapshot(ledger, server.url, api_key, live=False, stats=stats)
@@ -195,5 +206,8 @@ def watch(fail=None, duration=10.0, rate=20.0, interval=1.0, gzip=False,
                           gzip=gzip, started_at=start, duration_s=round(time.time() - start, 3),
                           ticks=ticks, ledger_lines_skipped=stats.get("skipped", 0), **emitter)
     report["artifacts"]["sdk_ledger"] = os.path.abspath(ledger)
+    if emitter.get("interrupted"):
+        report["ok"] = False
+        report["verdict"] = "INTERRUPTED (partial, not a verdict): " + report["verdict"]
     write_report(report, workdir, secrets=(api_key,))
     return report

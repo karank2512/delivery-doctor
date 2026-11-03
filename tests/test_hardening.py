@@ -19,7 +19,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from delivery_doctor import doctor
+from delivery_doctor import doctor, safety
 from delivery_doctor import watch as watch_mod
 from delivery_doctor.doctor import (REPO_ROOT, WRONG_API_KEY, build_report, classify,
                                     query_intake, read_ledger, render_table, run_check,
@@ -569,6 +569,159 @@ class QuickstartSmokeTests(TempCase):
         self.assertIn("FAIL: 10/12 landed; 2 never sent by client (buffer drop)", broken.stdout)
         self.assertEqual(self.cli("check", "--n", "0").returncode, 2)
         self.assertEqual(self.cli("nonsense").returncode, 2)
+
+
+class ReviewRegressionTests(TempCase):
+    """Defects found by independent review of the first hardening pass."""
+
+    def attach(self, ledger_lines, handler=None, extra=()):
+        ledger = self.tmp / "l.jsonl"
+        ledger.write_text("".join(l + "\n" for l in ledger_lines))
+        ctx = fake_server(handler) if handler else IntakeServer(str(self.tmp / "log.jsonl"))
+        with ctx as srv:
+            url = srv[0] if handler else srv.url
+            return self.run_cli(["watch", "--ledger", str(ledger), "--intake", url,
+                                 "--duration", "0.2", "--interval", "0.1", *extra])
+
+    def test_hostile_intake_responses_exit_3_not_traceback(self):
+        def raw_reply(payload):
+            class H(Quiet):
+                def do_GET(self):
+                    self._send(200, payload)
+            return H
+
+        class Garbage(Quiet):
+            def do_GET(self):
+                self.wfile.write(b"NOT HTTP\r\n\r\n")
+        line = json.dumps({"event_id": "e1", "stage": "buffered", "t": 1})
+        for name, handler in (("status line", Garbage),
+                              ("deep json", raw_reply(b"[" * 100000)),
+                              ("list id", raw_reply(b'{"entries":[{"event_id":["x"],"status":"accepted"}]}'))):
+            with self.subTest(name):
+                code, out, err = self.attach([line], handler)
+                self.assertNotIn("Traceback", err)
+                if name == "list id":
+                    self.assertEqual(code, 1)  # bogus entry ignored; e1 just did not land
+                else:
+                    self.assertEqual(code, 3)
+
+    def test_ledger_with_wrong_field_types_does_not_crash(self):
+        lines = [json.dumps({"event_id": "e1", "stage": "failed"}),
+                 json.dumps({"event_id": "e2", "stage": "failed", "kind": "connection"}),
+                 json.dumps({"event_id": "e3", "stage": "buffered", "bytes": "big", "t": "x"}),
+                 json.dumps({"event_id": "e4", "stage": "buffered", "t": 1e300}),
+                 json.dumps({"event_id": "e5", "stage": "failed", "kind": "http", "status": "401",
+                             "attempts": [1]})]
+        out_html = self.tmp / "r.html"
+        code, out, err = self.attach(lines, extra=["--json", "--html", str(out_html)])
+        self.assertEqual(code, 1, err)
+        self.assertNotIn("Traceback", err)
+        self.assertTrue(out_html.exists())
+
+    def test_overflowing_numbers_and_unreadable_reports(self):
+        src = self.tmp / "big.json"
+        src.write_text('{"run_id":"r","ok":false,"verdict":"v","total":1' + "0" * 400 + ',"events":'
+                       '[{"event_id":"e","evidence":{"ledger":[{"t":1' + "0" * 400 + '}],"intake":[]}}]}')
+        self.assertEqual(self.run_cli(["report", "--html", str(self.tmp / "a.html"),
+                                       "--from", str(src)])[0], 1)
+        deep = self.tmp / "deep.json"
+        deep.write_text("[" * 100000)
+        self.assertEqual(self.run_cli(["report", "--html", str(self.tmp / "b.html"),
+                                       "--from", str(deep)])[0], 2)
+        if os.name == "posix" and os.getuid() != 0:
+            locked = self.tmp / "locked.json"
+            locked.write_text("{}")
+            locked.chmod(0)
+            code, _, err = self.run_cli(["report", "--html", str(self.tmp / "c.html"),
+                                         "--from", str(locked)])
+            self.assertEqual(code, 2)
+            self.assertIn("cannot read", err)
+
+    def test_unexpected_exception_maps_to_exit_3(self):
+        with mock.patch.object(doctor, "emitter_cmd", side_effect=RuntimeError("kaboom")):
+            code, _, err = self.run_cli(["check", "--n", "2"])
+        self.assertEqual(code, 3)
+        self.assertIn("internal error", err)
+
+    def test_interrupted_watch_exits_130_and_does_not_pass(self):
+        calls = {"n": 0}
+        real = watch_mod.snapshot
+
+        def interrupt_once(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise KeyboardInterrupt
+            return real(*a, **kw)
+
+        with mock.patch.object(watch_mod, "snapshot", side_effect=interrupt_once):
+            code, out, _ = self.run_cli(["watch", "--duration", "5", "--interval", "0.2"])
+        self.assertEqual(code, 130)
+        self.assertIn("INTERRUPTED", out)
+        self.assertNotIn("\nPASS", out)
+
+    def test_report_from_is_redacted_too(self):
+        src = self.tmp / "leaky.json"
+        src.write_text(json.dumps({"run_id": "r", "ok": False, "verdict": "v", "events": [
+            {"event_id": "e", "detail": f"body had {DEFAULT_API_KEY}",
+             "evidence": {"ledger": [], "intake": [{"event": {"api_key": "sk-live-AAA"}}]}}]}))
+        out = self.tmp / "o.html"
+        self.run_cli(["report", "--html", str(out), "--from", str(src)])
+        page = out.read_text()
+        self.assertNotIn("sk-live-AAA", page)
+        self.assertNotIn(DEFAULT_API_KEY, page)
+
+    def test_slow_drip_read_back_hits_overall_deadline(self):
+        class Drip(Quiet):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                try:
+                    for _ in range(1000):
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(0.2)
+                except OSError:
+                    pass
+        with fake_server(Drip) as (url, _):
+            start = time.time()
+            with self.assertRaises(DoctorError):
+                get_json(url, {}, timeout=0.5)
+            self.assertLess(time.time() - start, 2.5)  # 2 * timeout + one read
+
+    def test_error_text_masks_the_read_key(self):
+        class Echo(Quiet):
+            def do_GET(self):
+                self._send(401, json.dumps({"error": "bad key " + self.headers["X-Api-Key"]}).encode())
+        line = json.dumps({"event_id": "e1", "stage": "buffered", "t": 1})
+        with mock.patch.dict(os.environ, {"DELIVERY_DOCTOR_API_KEY": "secret-READKEY-123"}):
+            code, _, err = self.attach([line], Echo)
+        self.assertEqual(code, 3)
+        self.assertNotIn("secret-READKEY-123", err)
+        self.assertIn("[redacted]", err)
+
+    def test_key_cut_at_truncation_boundary_is_still_masked(self):
+        noise = "x" * 995
+        crash = [sys.executable, "-c",
+                 f"import sys; sys.stderr.write('{DEFAULT_API_KEY}' + '{noise}'); sys.exit(4)"]
+        with mock.patch.object(doctor, "emitter_cmd", return_value=crash):
+            _, _, err = self.run_cli(["check", "--n", "2"])
+        self.assertNotIn(DEFAULT_API_KEY[-6:] + "x", err)
+
+    def test_redaction_key_names_and_short_secrets(self):
+        out = safety.redact({"prompt_tokens": 5, "access_token": "a", "private_key": "b",
+                             "auth": "c", "session": "d", "note": "e e e"}, secrets=("e",))
+        self.assertEqual(out["prompt_tokens"], 5)
+        self.assertEqual(out["note"], "e e e")  # 1-char "secret" is not substring-masked
+        for k in ("access_token", "private_key", "auth", "session"):
+            self.assertEqual(out[k], "[redacted]")
+
+    def test_watch_volume_cap_is_a_usage_error(self):
+        self.assertEqual(self.run_cli(["watch", "--rate", "1000", "--duration", "3600"])[0], 2)
+
+    def test_ipv4_mapped_loopback_is_consistent(self):
+        self.assertTrue(safety.is_loopback_host("::ffff:127.0.0.1"))
+        self.assertFalse(safety.is_loopback_host("::ffff:10.0.0.1"))
 
 
 if __name__ == "__main__":

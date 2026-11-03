@@ -46,9 +46,10 @@ def _is_loopback(host):
     if host == "localhost":
         return True
     try:
-        return ipaddress.ip_address((host or "").strip("[]")).is_loopback
+        ip = ipaddress.ip_address((host or "").strip("[]"))
     except ValueError:
         return False
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
 
 
 def event_size(event):

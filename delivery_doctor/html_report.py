@@ -18,7 +18,7 @@ import math
 import os
 import time
 
-from delivery_doctor.doctor import STOP_POINTS
+from delivery_doctor.doctor import STOP_POINTS, sanitize_report
 from delivery_doctor.safety import atomic_write
 
 STAGE_COLORS = {
@@ -92,7 +92,7 @@ def _num(v, default=0.0):
         return default
     try:
         v = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return v if math.isfinite(v) else default
 
@@ -162,6 +162,7 @@ def _timeline(finding, t0, span):
 
 
 def render_html(report):
+    report = sanitize_report(report)  # also covers reports loaded with `report --from`
     ok = report.get("ok") is True
     t0, t1 = _times(report)
     span = max(t1 - t0, 1e-3)
