@@ -4,7 +4,7 @@
 
 [![Delivery Doctor demo](docs/demo.gif)](docs/demo.mp4)
 
-*15 second demo: [docs/demo.mp4](docs/demo.mp4). Its terminal scene shows the output of the injected buffer-drop case, `check --fail buffer`; a plain `check` on a healthy setup passes.*
+*15 second demo: [docs/demo.mp4](docs/demo.mp4). Its terminal scene shows captured output from `check --fail buffer`, with the command and mock-only scope visible; a plain `check` on a healthy local setup passes.*
 
 **Scope:** This is a hardened local diagnostic prototype, not a production-validated integration. The included SDK and intake are mocks. No real vendor SDK, backend read-back API, or production overhead has been validated. See [Readiness](#readiness).
 
